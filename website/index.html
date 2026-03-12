@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ShutdownTimer — Agende o desligamento do seu PC</title>
+  <meta name="description" content="Ferramenta gratuita e open-source para agendar o desligamento ou suspensão do seu computador com precisão." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@300;400;500;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ░░ CURSOR GLOW ░░ -->
+  <div class="cursor-glow" id="cursorGlow"></div>
+
+  <!-- ░░ CANVAS BACKGROUND ░░ -->
+  <canvas id="bgCanvas"></canvas>
+
+  <!-- ░░ NAVBAR ░░ -->
+  <nav class="navbar" id="navbar">
+    <div class="nav-inner">
+      <a href="#" class="nav-logo">
+        <span class="logo-icon">⏻</span>
+        <span class="logo-text">ShutdownTimer</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="#features">Funcionalidades</a></li>
+        <li><a href="#howto">Como usar</a></li>
+        <li><a href="#security">Segurança</a></li>
+        <li><a href="#download" class="nav-cta">Download</a></li>
+      </ul>
+      <button class="nav-burger" id="navBurger" aria-label="Menu">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+    <div class="nav-mobile" id="navMobile">
+      <a href="#features">Funcionalidades</a>
+      <a href="#howto">Como usar</a>
+      <a href="#security">Segurança</a>
+      <a href="#download">Download</a>
+    </div>
+  </nav>
+
+  <!-- ░░ HERO ░░ -->
+  <section class="hero" id="hero">
+    <div class="hero-bg-grid"></div>
+    <div class="hero-content">
+      <div class="hero-badge">
+        <span class="badge-dot"></span>
+        Open Source · Gratuito · Windows
+      </div>
+      <h1 class="hero-title">
+        Controle <em>quando</em><br />seu PC desliga
+      </h1>
+      <p class="hero-sub">
+        Agende desligamento, suspensão ou bloqueio com precisão de segundos.<br class="br-desktop"/>
+        Interface moderna, código aberto, zero bloatware.
+      </p>
+
+      <!-- Live timer demo -->
+      <div class="hero-timer-demo" id="timerDemo">
+        <div class="timer-demo-ring">
+          <svg viewBox="0 0 120 120" class="ring-svg">
+            <circle class="ring-track" cx="60" cy="60" r="52"/>
+            <circle class="ring-fill" id="ringFill" cx="60" cy="60" r="52"
+              stroke-dasharray="326.7" stroke-dashoffset="0"/>
+          </svg>
+          <div class="timer-demo-inner">
+            <span class="timer-demo-digits" id="timerDigits">30:00</span>
+            <span class="timer-demo-label">demo</span>
+          </div>
+        </div>
+        <div class="timer-demo-controls">
+          <button class="demo-btn demo-btn-start" id="demoStart">▶ Iniciar</button>
+          <button class="demo-btn demo-btn-cancel" id="demoCancel">✕ Cancelar</button>
+        </div>
+      </div>
+
+      <div class="hero-actions">
+        <a href="#download" class="btn-primary">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Baixar para Windows
+        </a>
+        <a href="https://github.com" target="_blank" rel="noopener" class="btn-ghost">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          Ver no GitHub
+        </a>
+      </div>
+
+      <div class="hero-stats">
+        <div class="stat-item">
+          <span class="stat-num">~20MB</span>
+          <span class="stat-lbl">Tamanho</span>
+        </div>
+        <div class="stat-sep"></div>
+        <div class="stat-item">
+          <span class="stat-num">0</span>
+          <span class="stat-lbl">Dependências</span>
+        </div>
+        <div class="stat-sep"></div>
+        <div class="stat-item">
+          <span class="stat-num">MIT</span>
+          <span class="stat-lbl">Licença</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="hero-scroll-hint">
+      <span>role para baixo</span>
+      <div class="scroll-arrow"></div>
+    </div>
+  </section>
+
+  <!-- ░░ FEATURES ░░ -->
+  <section class="features section" id="features">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">Funcionalidades</span>
+        <h2 class="section-title">Tudo que você precisa,<br/>nada que você não precisa</h2>
+      </div>
+      <div class="features-grid">
+
+        <div class="feat-card" data-delay="0">
+          <div class="feat-icon-wrap">
+            <span class="feat-icon">⏱</span>
+          </div>
+          <h3>Agendamento simples</h3>
+          <p>Digite os minutos, pressione iniciar. Suporta presets de 15min, 30min, 1h e 2h para acesso rápido.</p>
+        </div>
+
+        <div class="feat-card" data-delay="80">
+          <div class="feat-icon-wrap">
+            <span class="feat-icon">⏻</span>
+          </div>
+          <h3>Desligamento automático</h3>
+          <p>Executa <code>shutdown</code> nativo do Windows com segurança, sem forçar processos abertos.</p>
+        </div>
+
+        <div class="feat-card" data-delay="160">
+          <div class="feat-icon-wrap">
+            <span class="feat-icon">🌙</span>
+          </div>
+          <h3>Suspensão do sistema</h3>
+          <p>Suspende o PC conservando o estado de sessão. Ideal para pausas longas sem perder o trabalho.</p>
+        </div>
+
+        <div class="feat-card" data-delay="240">
+          <div class="feat-icon-wrap">
+            <span class="feat-icon">⏳</span>
+          </div>
+          <h3>Contagem regressiva</h3>
+          <p>Barra de progresso e display mm:ss atualizado em tempo real. Alerta visual nos últimos 60 segundos.</p>
+        </div>
+
+        <div class="feat-card" data-delay="320">
+          <div class="feat-icon-wrap">
+            <span class="feat-icon">✕</span>
+          </div>
+          <h3>Cancelamento rápido</h3>
+          <p>Um clique cancela tudo. Janela de confirmação de 15s dá uma segunda chance antes da ação final.</p>
+        </div>
+
+        <div class="feat-card" data-delay="400">
+          <div class="feat-icon-wrap">
+            <span class="feat-icon">🖥</span>
+          </div>
+          <h3>Interface moderna</h3>
+          <p>UI dark com customtkinter. Modo gamer, widget flutuante, bandeja do sistema e atalhos globais.</p>
+        </div>
+
+        <div class="feat-card feat-card--wide" data-delay="80">
+          <div class="feat-icon-wrap">
+            <span class="feat-icon">🔒</span>
+          </div>
+          <h3>Bloqueio de tela</h3>
+          <p>Além de desligar ou suspender, agende o bloqueio automático da sessão. Útil ao sair do escritório.</p>
+        </div>
+
+        <div class="feat-card feat-card--wide" data-delay="160">
+          <div class="feat-icon-wrap">
+            <span class="feat-icon">🎮</span>
+          </div>
+          <h3>Modo Gamer</h3>
+          <p>Detecta fullscreen ou processos específicos (ex: valorant.exe) e pausa o timer automaticamente enquanto você joga.</p>
+        </div>
+
+        <div class="feat-card feat-card--wide" data-delay="240">
+          <div class="feat-icon-wrap">
+            <span class="feat-icon">⚡</span>
+          </div>
+          <h3>Bandeja do sistema</h3>
+          <p>Minimiza para o system tray. Acesso rápido via menu de contexto: shutdown 30min, 1h, cancelar — sem abrir a janela.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ░░ HOW TO USE ░░ -->
+  <section class="howto section" id="howto">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">Como usar</span>
+        <h2 class="section-title">Pronto em quatro passos</h2>
+      </div>
+      <div class="steps-track">
+        <div class="steps-line"></div>
+        <div class="step-item" data-step="1">
+          <div class="step-node">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          </div>
+          <div class="step-body">
+            <h3>Baixe o executável</h3>
+            <p>Faça o download do <code>.exe</code> — sem instalador, sem permissões de admin. Só execute.</p>
+          </div>
+        </div>
+        <div class="step-item" data-step="2">
+          <div class="step-node">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </div>
+          <div class="step-body">
+            <h3>Escolha o tempo</h3>
+            <p>Digite os minutos desejados ou use os presets rápidos: 15, 30, 60 ou 120 minutos.</p>
+          </div>
+        </div>
+        <div class="step-item" data-step="3">
+          <div class="step-node">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 11-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+          </div>
+          <div class="step-body">
+            <h3>Escolha a ação</h3>
+            <p>Desligar, suspender, reiniciar ou bloquear. Cada ação tem um comportamento bem definido.</p>
+          </div>
+        </div>
+        <div class="step-item" data-step="4">
+          <div class="step-node">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          </div>
+          <div class="step-body">
+            <h3>Clique em Iniciar</h3>
+            <p>A contagem começa. Minimize para a bandeja e esqueça — o ShutdownTimer cuida do resto.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ░░ SCREENSHOTS ░░ -->
+  <section class="screenshots section" id="screenshots">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">Interface</span>
+        <h2 class="section-title">Simples de ver,<br />simples de usar</h2>
+      </div>
+      <div class="screens-showcase">
+
+        <!-- Tela principal simulada -->
+        <div class="mockup-window mockup-main" data-reveal>
+          <div class="mockup-bar">
+            <span class="mockup-dot r"></span>
+            <span class="mockup-dot y"></span>
+            <span class="mockup-dot g"></span>
+            <span class="mockup-title">⏻ ShutdownTimer</span>
+            <span class="mockup-platform">🖥 Windows</span>
+          </div>
+          <div class="mockup-body">
+            <div class="app-mode-row">
+              <button class="app-mode-btn active">⏱ Contagem</button>
+              <button class="app-mode-btn">🕐 Horário</button>
+            </div>
+            <div class="app-presets">
+              <button class="app-preset">15min</button>
+              <button class="app-preset active">30min</button>
+              <button class="app-preset">1h</button>
+              <button class="app-preset">2h</button>
+            </div>
+            <div class="app-input-label">Tempo (minutos)</div>
+            <div class="app-input-mock">30</div>
+            <div class="app-action-label">Ação</div>
+            <div class="app-actions">
+              <button class="app-action active">⏻ Desligar</button>
+              <button class="app-action">🌙 Suspender</button>
+              <button class="app-action">↺ Reiniciar</button>
+              <button class="app-action">🔒 Bloquear</button>
+            </div>
+            <div class="app-progress-bar">
+              <div class="app-progress-fill" id="appProgressFill"></div>
+            </div>
+            <div class="app-timer-display" id="appTimerDisplay">28:43</div>
+            <div class="app-status">⏻ Desligar em 30min</div>
+            <button class="app-cancel-btn">⏹ Cancelar</button>
+          </div>
+        </div>
+
+        <!-- Tela widget & tray simulados -->
+        <div class="mockup-side-col">
+          <div class="mockup-window mockup-tray" data-reveal>
+            <div class="mockup-bar small">
+              <span class="mockup-dot r"></span>
+              <span class="mockup-dot y"></span>
+              <span class="mockup-dot g"></span>
+              <span class="mockup-title small">System Tray</span>
+            </div>
+            <div class="mockup-body tray-body">
+              <div class="tray-icon-row">
+                <div class="tray-icon">⏻</div>
+                <span class="tray-timer-text">28:43</span>
+              </div>
+              <div class="tray-menu">
+                <div class="tray-menu-item header">⏻ ShutdownTimer</div>
+                <div class="tray-sep"></div>
+                <div class="tray-menu-item">Abrir janela</div>
+                <div class="tray-menu-item">⧉ Widget compacto</div>
+                <div class="tray-sep"></div>
+                <div class="tray-menu-item accent">▶ Shutdown 30min</div>
+                <div class="tray-menu-item">▶ Shutdown 1h</div>
+                <div class="tray-menu-item">▶ Suspender 30min</div>
+                <div class="tray-sep"></div>
+                <div class="tray-menu-item danger">⏹ Cancelar timer</div>
+                <div class="tray-sep"></div>
+                <div class="tray-menu-item muted">✕ Sair</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="mockup-window mockup-widget" data-reveal>
+            <div class="mockup-bar small">
+              <span class="mockup-dot r"></span>
+              <span class="mockup-dot y"></span>
+              <span class="mockup-dot g"></span>
+              <span class="mockup-title small">Widget flutuante</span>
+            </div>
+            <div class="mockup-body widget-body">
+              <div class="widget-inner">
+                <span class="widget-icon">⏻</span>
+                <span class="widget-time" id="widgetTime">28:43</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="mockup-window mockup-dialog" data-reveal>
+            <div class="mockup-bar small">
+              <span class="mockup-dot r"></span>
+              <span class="mockup-dot y"></span>
+              <span class="mockup-dot g"></span>
+              <span class="mockup-title small">Confirmar ação</span>
+            </div>
+            <div class="mockup-body dialog-body">
+              <div class="dlg-icon">⏻</div>
+              <div class="dlg-title">Desligar em...</div>
+              <div class="dlg-countdown" id="dlgCountdown">12</div>
+              <div class="dlg-bar-wrap">
+                <div class="dlg-bar-fill" id="dlgBarFill"></div>
+              </div>
+              <button class="dlg-cancel-btn">✕ Cancelar ação</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ░░ SECURITY ░░ -->
+  <section class="security section" id="security">
+    <div class="container">
+      <div class="security-inner">
+        <div class="security-text">
+          <span class="section-tag">Segurança</span>
+          <h2 class="section-title">Nada a esconder</h2>
+          <p class="security-lead">ShutdownTimer foi construído com transparência radical. Nenhum dado é coletado. Nenhuma rede é acessada. Nenhum processo fica rodando em segundo plano além do próprio timer.</p>
+          <ul class="security-list">
+            <li>
+              <span class="sec-check">✓</span>
+              <div>
+                <strong>Código 100% aberto</strong>
+                <span>Cada linha auditável no GitHub. Fork e modifique como quiser.</span>
+              </div>
+            </li>
+            <li>
+              <span class="sec-check">✓</span>
+              <div>
+                <strong>Zero telemetria</strong>
+                <span>O app não faz nenhuma requisição de rede. Nunca. Verifique com Wireshark.</span>
+              </div>
+            </li>
+            <li>
+              <span class="sec-check">✓</span>
+              <div>
+                <strong>~20MB, sem instalador</strong>
+                <span>Executável portátil. Sem DLLs extras, sem entradas no registro (exceto autostart opt-in).</span>
+              </div>
+            </li>
+            <li>
+              <span class="sec-check">✓</span>
+              <div>
+                <strong>Licença MIT</strong>
+                <span>Use, distribua, modifique e venda sem restrições. Sem strings attached.</span>
+              </div>
+            </li>
+          </ul>
+        </div>
+        <div class="security-card-wrap">
+          <div class="security-card">
+            <div class="sc-header">
+              <span class="sc-dot green"></span>
+              <span class="sc-dot yellow"></span>
+              <span class="sc-dot red"></span>
+              <span class="sc-title">network_monitor.log</span>
+            </div>
+            <div class="sc-body">
+              <div class="sc-line"><span class="sc-t">00:00:01</span><span class="sc-c ok">✓ App iniciado</span></div>
+              <div class="sc-line"><span class="sc-t">00:00:01</span><span class="sc-c ok">✓ Timer iniciado: 30min</span></div>
+              <div class="sc-line"><span class="sc-t">00:00:01</span><span class="sc-c muted">— Conexões de rede: 0</span></div>
+              <div class="sc-line"><span class="sc-t">00:00:01</span><span class="sc-c muted">— Processos filhos: 0</span></div>
+              <div class="sc-line"><span class="sc-t">00:00:01</span><span class="sc-c muted">— Writes no registro: 0</span></div>
+              <div class="sc-line"><span class="sc-t">00:00:01</span><span class="sc-c ok">✓ Dados enviados: 0 bytes</span></div>
+              <div class="sc-line sc-line--blink"><span class="sc-t">——</span><span class="sc-c ok">▌ monitorando...</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ░░ GITHUB ░░ -->
+  <section class="github-section section" id="github">
+    <div class="container">
+      <div class="github-inner">
+        <div class="github-icon-big">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+        </div>
+        <div class="github-text">
+          <h2>Contribua ou explore o código</h2>
+          <p>ShutdownTimer é construído em público. Abra uma issue, mande um PR, ou simplesmente leia o código para entender como funciona.</p>
+          <a href="https://github.com" target="_blank" rel="noopener" class="btn-primary btn-large">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+            Ver código fonte no GitHub
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ░░ DOWNLOAD ░░ -->
+  <section class="download-section section" id="download">
+    <div class="container">
+      <div class="download-card">
+        <div class="download-glow"></div>
+        <div class="download-content">
+          <div class="dl-left">
+            <div class="dl-badge">
+              <span class="dl-badge-dot"></span>
+              Versão mais recente
+            </div>
+            <h2 class="dl-title">ShutdownTimer</h2>
+            <div class="dl-meta">
+              <span class="dl-tag">Windows 10/11</span>
+              <span class="dl-tag">Python 3.10+</span>
+              <span class="dl-tag">~20 MB</span>
+              <span class="dl-tag">MIT License</span>
+            </div>
+            <ul class="dl-features">
+              <li>✓ Executável portátil — sem instalação</li>
+              <li>✓ Sem coleta de dados</li>
+              <li>✓ Funciona offline</li>
+              <li>✓ Código fonte disponível</li>
+            </ul>
+          </div>
+          <div class="dl-right">
+            <a href="#" class="btn-download" id="downloadBtn">
+              <div class="btn-download-icon">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              </div>
+              <div class="btn-download-text">
+                <span class="btn-dl-main">Download .EXE</span>
+                <span class="btn-dl-sub">Windows 10 / 11 · 64-bit</span>
+              </div>
+            </a>
+            <a href="https://github.com" target="_blank" rel="noopener" class="btn-ghost btn-sm">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+              Código fonte
+            </a>
+            <p class="dl-note">Verifique sempre o hash SHA-256 antes de executar.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ░░ FOOTER ░░ -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-brand">
+          <span class="logo-icon">⏻</span>
+          <span class="logo-text">ShutdownTimer</span>
+          <p>Ferramenta open-source para agendamento de desligamento no Windows.</p>
+        </div>
+        <div class="footer-links">
+          <div class="footer-col">
+            <h4>Produto</h4>
+            <a href="#features">Funcionalidades</a>
+            <a href="#howto">Como usar</a>
+            <a href="#download">Download</a>
+          </div>
+          <div class="footer-col">
+            <h4>Projeto</h4>
+            <a href="https://github.com" target="_blank" rel="noopener">GitHub</a>
+            <a href="https://github.com" target="_blank" rel="noopener">Issues</a>
+            <a href="https://github.com" target="_blank" rel="noopener">Changelog</a>
+          </div>
+          <div class="footer-col">
+            <h4>Legal</h4>
+            <a href="#">Licença MIT</a>
+            <a href="#">Política de privacidade</a>
+          </div>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2025 ShutdownTimer — Licença MIT</span>
+        <span>Feito com Python + customtkinter</span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
