@@ -807,7 +807,7 @@ class ShutdownApp:
     def _build_window(self):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
-        W, H = 480, 680
+        W, H = 480, 770
         self.root.title("ShutdownTimer")
         self.root.geometry(f"{W}x{H}")
         self.root.resizable(False, False)
