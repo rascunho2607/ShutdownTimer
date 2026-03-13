@@ -1,77 +1,61 @@
-ShutdownTimer v3.0
-https://img.shields.io/badge/License-MIT-yellow.svg
-https://img.shields.io/badge/python-3.7+-blue.svg
-https://img.shields.io/badge/platform-Windows%2520%257C%2520Linux%2520%257C%2520macOS-lightgrey
+# ShutdownTimer v3.0
+
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 
 Um agendador inteligente de desligamento com interface gráfica moderna, widget flutuante, monitoramento condicional e suporte completo a linha de comando.
 
-https://via.placeholder.com/800x500?text=ShutdownTimer+v3.0+Screenshot
+<div align="center">
+  <img width="442" height="872" alt="Interface Principal" src="https://github.com/user-attachments/assets/25e17de5-42d5-48b4-8cfb-7a113b3e1e71" />
+  <img width="442" height="872" alt="Configurações" src="https://github.com/user-attachments/assets/fff044ae-f7f5-4619-8292-7a454cd71d56" />
+  <img width="160" height="48" alt="Widget Flutuante" src="https://github.com/user-attachments/assets/cead8867-21c6-427a-a20c-cb1843615f45" />
+</div>
 
-✨ Características
-⏱ Múltiplos modos de agendamento
+## ✨ Características
 
-Contagem regressiva personalizável
+### ⏱ Múltiplos modos de agendamento
+- Contagem regressiva personalizável
+- Horário específico (executa às HH:MM)
+- Presets rápidos (15, 30, 60, 120 minutos)
 
-Horário específico (executa às HH:MM)
+### 🎯 Ações suportadas
+- Desligar (shutdown)
+- Suspender (sleep)
+- Reiniciar (reboot)
+- Bloquear tela (lock)
 
-Presets rápidos (15, 30, 60, 120 minutos)
+### 🧠 Monitoramento condicional (requer psutil)
+- Desligar quando CPU ficar abaixo de X%
+- Aguardar processo específico encerrar
+- Detectar conclusão de downloads
+- Executar após período de inatividade
 
-🎯 Ações suportadas
+### 🎮 Modo Gamer inteligente
+- Pausa automaticamente durante jogos em tela cheia
+- Detecta processos configuráveis (ex: valorant.exe, blender.exe)
+- Resume quando você volta
 
-Desligar (shutdown)
+### 📊 Recursos avançados
+- Timer adaptativo (estende automaticamente com atividade)
+- Histórico completo e estatísticas
+- Exportação para CSV/JSON
+- Atalhos globais de teclado
+- Widget flutuante transparente
+- Ícone na bandeja do sistema
+- Notificações nativas
+- Inicialização automática com o sistema
 
-Suspender (sleep)
+## 🚀 Instalação
 
-Reiniciar (reboot)
+### Pré-requisitos
+- Python 3.7 ou superior
+- pip (gerenciador de pacotes Python)
 
-Bloquear tela (lock)
-
-🧠 Monitoramento condicional (requer psutil)
-
-Desligar quando CPU ficar abaixo de X%
-
-Aguardar processo específico encerrar
-
-Detectar conclusão de downloads
-
-Executar após período de inatividade
-
-🎮 Modo Gamer inteligente
-
-Pausa automaticamente durante jogos em tela cheia
-
-Detecta processos configuráveis (ex: valorant.exe, blender.exe)
-
-Resume quando você volta
-
-📊 Recursos avançados
-
-Timer adaptativo (estende automaticamente com atividade)
-
-Histórico completo e estatísticas
-
-Exportação para CSV/JSON
-
-Atalhos globais de teclado
-
-Widget flutuante transparente
-
-Ícone na bandeja do sistema
-
-Notificações nativas
-
-Inicialização automática com o sistema
-
-🚀 Instalação
-Pré-requisitos
-Python 3.7 ou superior
-
-pip (gerenciador de pacotes Python)
-
-Instalação básica
-bash
+### Instalação básica
+```bash
 # Clone o repositório
-git clone https://github.com/yourusername/shutdowntimer.git
+git clone https://github.com/rascunho2607/ShutdownTimer.git
 cd shutdowntimer
 
 # Instale a dependência obrigatória
