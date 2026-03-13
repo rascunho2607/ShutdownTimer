@@ -432,7 +432,7 @@ class ConfigManager:
         "schedule_mode":        "countdown",
         "schedule_hour":        23,
         "schedule_minute":      30,
-        "cond_enabled":         False,
+        "cond_enabled":         True,
         "cond_action":          "shutdown",
         "conditions":           [],
         "stats": {"total_completed": 0, "by_action": {}, "total_minutes": 0},
@@ -807,7 +807,7 @@ class ShutdownApp:
     def _build_window(self):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
-        W, H = 440, 840
+        W, H = 480, 680
         self.root.title("ShutdownTimer")
         self.root.geometry(f"{W}x{H}")
         self.root.resizable(False, False)
@@ -866,7 +866,7 @@ class ShutdownApp:
         f = self._card("Modo")
         self.mode_var = ctk.StringVar(value=self.config.get("schedule_mode"))
         row = ctk.CTkFrame(f, fg_color="transparent")
-        row.pack(fill="x", padx=16, pady=(0, 14))
+        row.pack(fill="x", padx=16, pady=(14, 14))
         self._mode_btns: dict = {}
         for key, lbl in [("countdown", "⏱  Contagem regressiva"),
                          ("schedule",  "🕐  Horário específico")]:
@@ -881,7 +881,7 @@ class ShutdownApp:
     def _build_presets(self):
         f = self._card("Presets rápidos")
         row = ctk.CTkFrame(f, fg_color="transparent")
-        row.pack(fill="x", padx=16, pady=(0, 14))
+        row.pack(fill="x", padx=16, pady=(14, 14))
         for m in self.config.get("presets"):
             lbl = f"{m}min" if m < 60 else f"{m // 60}h"
             ctk.CTkButton(
@@ -943,7 +943,7 @@ class ShutdownApp:
         f = self._card("Ação")
         self.action_var = ctk.StringVar(value=self.config.get("last_action"))
         grid = ctk.CTkFrame(f, fg_color="transparent")
-        grid.pack(fill="x", padx=16, pady=(0, 14))
+        grid.pack(fill="x", padx=16, pady=(14, 14))
         self._action_buttons: dict = {}
         for idx, (key, label) in enumerate(ACTION_LABELS.items()):
             btn = ctk.CTkButton(
@@ -975,6 +975,22 @@ class ShutdownApp:
             f, text="Aguardando início",
             font=ctk.CTkFont(size=12), text_color=COLORS["text_dim"])
         self.status_label.pack(pady=(2, 14))
+
+        
+        self.start_btn = ctk.CTkButton(
+            f, text="▶  Iniciar", height=50,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            text_color="white", corner_radius=10,
+            command=self._start_or_stop)
+        self.start_btn.pack(fill="x", padx=16, pady=(2, 2))
+
+        self.pause_btn = ctk.CTkButton(
+            f, text="⏸  Pausar", height=36, font=ctk.CTkFont(size=13),
+            fg_color=COLORS["surface"], hover_color=COLORS["surface2"],
+            text_color=COLORS["text_dim"], corner_radius=8, state="disabled",
+            command=self._pause_resume)
+        self.pause_btn.pack(expand=True, fill="x", padx=16, pady=(2, 14))
 
     def _build_options(self):
         f = self._card("Opções")
@@ -1043,9 +1059,9 @@ class ShutdownApp:
 
     def _build_conditional(self):
         f = self._card("Shutdown Condicional")
-        self.cond_enabled_var = ctk.BooleanVar(value=self.config.get("cond_enabled"))
-        self._switch(f, "Executar ação quando condição satisfeita",
-                     self.cond_enabled_var)
+        # self.cond_enabled_var = ctk.BooleanVar(value=self.config.get("cond_enabled"))
+        # self._switch(f, "Executar ação quando condição satisfeita",
+        #              self.cond_enabled_var)
 
         if not HAS_PSUTIL:
             ctk.CTkLabel(f, text="⚠  Instale psutil para usar este recurso",
@@ -1056,7 +1072,7 @@ class ShutdownApp:
 
         # Ação condicional
         cr = ctk.CTkFrame(f, fg_color="transparent")
-        cr.pack(fill="x", padx=16, pady=(0, 8))
+        cr.pack(fill="x", padx=16, pady=(8, 8))
         ctk.CTkLabel(cr, text="Ação:", font=ctk.CTkFont(size=12),
                      text_color=COLORS["text_dim"]).pack(side="left", padx=(0, 8))
         self.cond_action_var = ctk.StringVar(value=self.config.get("cond_action"))
@@ -1116,21 +1132,8 @@ class ShutdownApp:
         f = ctk.CTkFrame(self._body, fg_color="transparent")
         f.pack(fill="x", padx=20, pady=(8, 4))
 
-        self.start_btn = ctk.CTkButton(
-            f, text="▶  Iniciar", height=50,
-            font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
-            text_color="white", corner_radius=10,
-            command=self._start_or_stop)
-        self.start_btn.pack(fill="x", pady=(0, 6))
-
         row2 = ctk.CTkFrame(f, fg_color="transparent"); row2.pack(fill="x")
-        self.pause_btn = ctk.CTkButton(
-            row2, text="⏸  Pausar", height=36, font=ctk.CTkFont(size=13),
-            fg_color=COLORS["surface"], hover_color=COLORS["surface2"],
-            text_color=COLORS["text_dim"], corner_radius=8, state="disabled",
-            command=self._pause_resume)
-        self.pause_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        
         ctk.CTkButton(
             row2, text="⧉  Widget", height=36, font=ctk.CTkFont(size=13),
             fg_color=COLORS["surface"], hover_color=COLORS["surface2"],
