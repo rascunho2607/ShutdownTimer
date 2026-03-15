@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║              ShutdownTimer  v4.0                             ║
+║              ShutdownTimer  v5.0                             ║
 ║  Agendador inteligente de desligamento para Windows/Linux    ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Arquitetura (separação total de responsabilidades):         ║
@@ -567,6 +567,348 @@ class SchedulerMonitor:
 
 
 # ══════════════════════════════════════════════════════════════
+# 5A. SMART MODE ENGINE
+# ══════════════════════════════════════════════════════════════
+
+class SmartModeEngine:
+    """
+    Gerenciamento inteligente de energia que aprende os hábitos de uso.
+
+    Módulos:
+      - Monitor de atividade (CPU, disco, rede, idle, uptime)
+      - Proteção de download  (bloqueia ações se rede ativa)
+      - Proteção de CPU       (adia ações se CPU ≥ threshold)
+      - Sugestão de reboot    (uptime > N dias)
+      - Hibernação em horários de baixa atividade
+      - Desligamento em longos períodos de inatividade
+      - Aprendizado de hábitos (JSON local)
+    """
+
+    POLL          = 60        # segundos entre verificações
+    HABITS_FILE   = Path.home() / ".shutdown_timer_habits.json"
+
+    # Limites padrão (configuráveis via config)
+    CPU_THRESHOLD       = 15.0   # %
+    NET_THRESHOLD_KB    = 100.0  # KB/s  — tráfego "ativo"
+    IDLE_SHUTDOWN_MIN   = 120    # min de inatividade → desligar
+    IDLE_SUSPEND_MIN    = 30     # min de inatividade → suspender
+    UPTIME_REBOOT_DAYS  = 5      # dias ligado → sugerir reboot
+    NET_WINDOW_SECS     = 60     # janela para medir taxa de rede
+
+    def __init__(self):
+        self._stop     = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock     = threading.Lock()
+
+        # Callbacks para a UI
+        self.on_action:     Optional[Callable[[str, str], None]] = None  # (action, reason)
+        self.on_suggestion: Optional[Callable[[str, str], None]] = None  # (kind, msg)
+        self.on_status:     Optional[Callable[[dict], None]]     = None  # snapshot dict
+
+        # Estado interno
+        self._net_prev_bytes: int   = 0
+        self._net_prev_ts:    float = 0.0
+        self._net_rate_kb:    float = 0.0
+        self._blocking:       bool  = False   # bloqueia ações enquanto True
+        self._last_reboot_suggestion: Optional[str] = None
+
+        # Hábitos carregados
+        self.habits: dict = self._load_habits()
+
+    # ── Ciclo principal ───────────────────────────────────
+
+    def start(self):
+        if self._thread and self._thread.is_alive(): return
+        self._stop.clear()
+        self._net_prev_bytes = SystemController.get_net_bytes_recv()
+        self._net_prev_ts    = time.time()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    @property
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive()
+                    and not self._stop.is_set())
+
+    def _run(self):
+        while not self._stop.wait(self.POLL):
+            try:
+                self._tick()
+            except Exception as e:
+                print(f"[SmartMode] tick error: {e}")
+
+    def _tick(self):
+        now      = datetime.now()
+        hour     = now.hour
+        minute   = now.minute
+
+        # ── Coleta métricas ───────────────────────────────
+        cpu      = SystemController.get_cpu_percent()
+        idle_s   = SystemController.get_idle_seconds()
+        net_rate = self._measure_net_rate()
+        uptime_d = self._get_uptime_days()
+
+        # Registra hábitos desta hora
+        self._record_habit(hour, cpu, idle_s)
+
+        snapshot = {
+            "cpu":      cpu,
+            "idle_min": round(idle_s / 60, 1),
+            "net_kb_s": round(net_rate, 1),
+            "uptime_d": round(uptime_d, 1),
+            "blocking": self._blocking,
+            "hour":     hour,
+        }
+        if self.on_status:
+            self.on_status(snapshot)
+
+        # ── Proteção de download ──────────────────────────
+        if net_rate > self.NET_THRESHOLD_KB:
+            self._blocking = True
+            return   # Não age enquanto há tráfego significativo
+        else:
+            self._blocking = False
+
+        # ── Proteção de CPU ───────────────────────────────
+        if cpu >= self.CPU_THRESHOLD:
+            return   # Adia decisão
+
+        # ── Sugestão de reboot por uptime ─────────────────
+        if uptime_d >= self.UPTIME_REBOOT_DAYS:
+            today = now.strftime("%Y-%m-%d")
+            if self._last_reboot_suggestion != today:
+                self._last_reboot_suggestion = today
+                msg = (f"O sistema está ligado há {uptime_d:.0f} dias. "
+                       "Considere reiniciar para manter a estabilidade.")
+                if self.on_suggestion:
+                    self.on_suggestion("reboot", msg)
+
+        # ── Hibernação em horário de baixa atividade ──────
+        if self._is_low_activity_hour(hour) and idle_s > 600:
+            # Só age na janela de inatividade e após 10min sem uso
+            if self.on_action:
+                self.on_action("suspend",
+                               f"Horário de baixa atividade ({hour:02d}h) "
+                               f"e inativo há {idle_s/60:.0f}min")
+            return
+
+        # ── Desligamento em longos períodos de inatividade ─
+        if idle_s >= self.IDLE_SHUTDOWN_MIN * 60:
+            # Previsão: usuário provavelmente não voltará em breve
+            if self._predict_no_return(hour):
+                if self.on_action:
+                    self.on_action("shutdown",
+                                   f"Inativo há {idle_s/60:.0f}min e sem "
+                                   "previsão de retorno")
+                return
+
+        # ── Suspensão em inatividade média ────────────────
+        if idle_s >= self.IDLE_SUSPEND_MIN * 60:
+            if self.on_action:
+                self.on_action("suspend",
+                               f"Inativo há {idle_s/60:.0f}min")
+
+    # ── Medição de rede ───────────────────────────────────
+
+    def _measure_net_rate(self) -> float:
+        """Retorna taxa de rede em KB/s desde a última medição."""
+        now_bytes = SystemController.get_net_bytes_recv()
+        now_ts    = time.time()
+        dt        = now_ts - self._net_prev_ts
+        if dt <= 0:
+            return self._net_rate_kb
+        rate_kb = (now_bytes - self._net_prev_bytes) / dt / 1024
+        self._net_prev_bytes = now_bytes
+        self._net_prev_ts    = now_ts
+        self._net_rate_kb    = max(0.0, rate_kb)
+        return self._net_rate_kb
+
+    # ── Uptime ────────────────────────────────────────────
+
+    @staticmethod
+    def _get_uptime_days() -> float:
+        try:
+            if HAS_PSUTIL:
+                return (time.time() - psutil.boot_time()) / 86400
+            if SystemController.PLATFORM == "Windows":
+                import ctypes
+                ms = ctypes.windll.kernel32.GetTickCount64()
+                return ms / 1000 / 86400
+        except Exception:
+            pass
+        return 0.0
+
+    # ── Aprendizado de hábitos ────────────────────────────
+
+    def _record_habit(self, hour: int, cpu: float, idle_s: float):
+        """Registra atividade desta hora no arquivo de hábitos."""
+        key = str(hour)
+        with self._lock:
+            h = self.habits.setdefault(key, {
+                "samples":    0,
+                "avg_cpu":    0.0,
+                "avg_idle_m": 0.0,
+                "active_pct": 0.0,
+            })
+            n = h["samples"]
+            h["avg_cpu"]    = (h["avg_cpu"]    * n + cpu)        / (n + 1)
+            h["avg_idle_m"] = (h["avg_idle_m"] * n + idle_s/60) / (n + 1)
+            active = 1.0 if idle_s < 120 else 0.0
+            h["active_pct"] = (h["active_pct"] * n + active)     / (n + 1)
+            h["samples"]    = n + 1
+        self._save_habits()
+
+    def _is_low_activity_hour(self, hour: int) -> bool:
+        """True se esta hora historicamente tem pouca atividade (< 20%)."""
+        h = self.habits.get(str(hour))
+        if not h or h["samples"] < 5:
+            # Sem dados suficientes: considera baixa atividade entre 02-06h
+            return 2 <= hour <= 6
+        return h["active_pct"] < 0.20
+
+    def _predict_no_return(self, hour: int) -> bool:
+        """True se historicamente o usuário raramente usa o PC nesta hora."""
+        h = self.habits.get(str(hour))
+        if not h or h["samples"] < 5:
+            return 1 <= hour <= 7   # madrugada como default
+        return h["active_pct"] < 0.10
+
+    def get_habits_summary(self) -> List[dict]:
+        """Retorna lista de horas com estatísticas para exibição na UI."""
+        rows = []
+        for hour in range(24):
+            h = self.habits.get(str(hour), {})
+            rows.append({
+                "hour":       hour,
+                "samples":    h.get("samples",    0),
+                "avg_cpu":    round(h.get("avg_cpu",    0.0), 1),
+                "avg_idle_m": round(h.get("avg_idle_m", 0.0), 1),
+                "active_pct": round(h.get("active_pct", 0.0) * 100, 0),
+            })
+        return rows
+
+    def _load_habits(self) -> dict:
+        try:
+            if self.HABITS_FILE.exists():
+                return json.loads(self.HABITS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_habits(self):
+        try:
+            with self._lock:
+                data = dict(self.habits)
+            self.HABITS_FILE.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception as e:
+            print(f"[SmartMode] save habits: {e}")
+
+    @property
+    def is_blocking(self) -> bool:
+        return self._blocking
+
+    def get_snapshot(self) -> dict:
+        """Leitura instantânea das métricas (sem esperar POLL)."""
+        return {
+            "cpu":      SystemController.get_cpu_percent(),
+            "idle_min": round(SystemController.get_idle_seconds() / 60, 1),
+            "net_kb_s": round(self._net_rate_kb, 1),
+            "uptime_d": round(self._get_uptime_days(), 1),
+            "blocking": self._blocking,
+        }
+
+
+# ══════════════════════════════════════════════════════════════
+# 5B. TOOLTIP
+# ══════════════════════════════════════════════════════════════
+
+class Tooltip:
+    """
+    Tooltip reutilizável para widgets tkinter/customtkinter.
+    Aparece após 500 ms de hover e desaparece ao mover o cursor.
+
+    Uso:
+        Tooltip(widget, "Texto do tooltip")
+    """
+
+    _DELAY_MS   = 500
+    _BG         = "#1e2235"
+    _FG         = "#c8cfe8"
+    _BORDER     = "#4f8ef7"
+    _FONT       = ("Segoe UI", 10)
+    _MAX_WIDTH  = 260   # pixels
+
+    def __init__(self, widget: tk.BaseWidget, text: str):
+        self._widget  = widget
+        self._text    = text
+        self._win:    Optional[tk.Toplevel] = None
+        self._job:    Optional[str]         = None
+
+        widget.bind("<Enter>",   self._on_enter,  add="+")
+        widget.bind("<Leave>",   self._on_leave,  add="+")
+        widget.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _on_enter(self, _event=None):
+        self._cancel()
+        self._job = self._widget.after(self._DELAY_MS, self._show)
+
+    def _on_leave(self, _event=None):
+        self._cancel()
+        self._hide()
+
+    def _on_destroy(self, _event=None):
+        self._cancel()
+        self._hide()
+
+    def _cancel(self):
+        if self._job:
+            try: self._widget.after_cancel(self._job)
+            except Exception: pass
+            self._job = None
+
+    def _show(self):
+        if self._win: return
+        x = self._widget.winfo_rootx() + 8
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+
+        self._win = tk.Toplevel(self._widget)
+        self._win.wm_overrideredirect(True)
+        self._win.wm_geometry(f"+{x}+{y}")
+        self._win.attributes("-topmost", True)
+
+        # Outer border frame
+        outer = tk.Frame(self._win, bg=self._BORDER, bd=0)
+        outer.pack(ipadx=1, ipady=1)
+
+        inner = tk.Frame(outer, bg=self._BG, bd=0)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        lbl = tk.Label(
+            inner, text=self._text,
+            font=self._FONT,
+            bg=self._BG, fg=self._FG,
+            justify="left", wraplength=self._MAX_WIDTH,
+            padx=10, pady=6)
+        lbl.pack()
+
+    def _hide(self):
+        if self._win:
+            try: self._win.destroy()
+            except Exception: pass
+            self._win = None
+
+
+def add_tooltip(widget: tk.BaseWidget, text: str) -> "Tooltip":
+    """Função helper de conveniência: cria e retorna um Tooltip."""
+    return Tooltip(widget, text)
+
+
+# ══════════════════════════════════════════════════════════════
 # 5. CONFIG MANAGER
 # ══════════════════════════════════════════════════════════════
 
@@ -595,6 +937,12 @@ class ConfigManager:
         "cond_action":            "shutdown",
         "conditions":             [],
         "scheduled_actions":      [],
+        "smart_mode":             False,
+        "smart_cpu_threshold":    15.0,
+        "smart_net_threshold_kb": 100.0,
+        "smart_idle_suspend_min": 30,
+        "smart_idle_shutdown_min":120,
+        "smart_uptime_reboot_d":  5,
         "stats": {
             "total_completed": 0,
             "by_action": {},
@@ -1171,6 +1519,7 @@ class ShutdownApp:
         self.engine     = TimerEngine()
         self.cond_mon   = ConditionMonitor()
         self.scheduler  = SchedulerMonitor()
+        self.smart      = SmartModeEngine()
         self.notif      = NotificationManager()
         self.tray       = TrayManager(self)
         self.hotkeys    = HotkeyManager()
@@ -1198,6 +1547,11 @@ class ShutdownApp:
         self._sched_actions = self.config.get_scheduled_actions()
         self.scheduler.start(lambda: self._sched_actions)
 
+        # Start Smart Mode if previously enabled
+        if self.config.get("smart_mode"):
+            self._apply_smart_config()
+            self.smart.start()
+
     # ── Callbacks ─────────────────────────────────────────
 
     def _setup_callbacks(self):
@@ -1210,6 +1564,9 @@ class ShutdownApp:
         self.cond_mon.on_condition_met = lambda a, d: after(
             0, self._on_condition_met, a, d)
         self.scheduler.on_fire = lambda sa: after(0, self._on_scheduled_fire, sa)
+        self.smart.on_action     = lambda a, r: after(0, self._on_smart_action,     a, r)
+        self.smart.on_suggestion = lambda k, m: after(0, self._on_smart_suggestion, k, m)
+        self.smart.on_status     = lambda s:    after(0, self._on_smart_status,     s)
 
     # ── Janela ────────────────────────────────────────────
 
@@ -1417,6 +1774,9 @@ class ShutdownApp:
             text_color=COLORS["text_dim"], corner_radius=8, state="disabled",
             command=self._extend_5min)
         self.extend5_btn.pack(side="left")
+        add_tooltip(self.extend5_btn,
+            "Adiciona 5 minutos ao timer atual. "
+            "Disponível apenas enquanto o timer estiver rodando.")
         ctk.CTkLabel(row5, text="estende o timer em 5 min",
                      font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_dim2"]).pack(side="left", padx=8)
@@ -1428,6 +1788,9 @@ class ShutdownApp:
             text_color="white", corner_radius=10,
             command=self._start_or_stop)
         self.start_btn.pack(fill="x", padx=16, pady=(2, 2))
+        add_tooltip(self.start_btn,
+            "Inicia o timer com o tempo e ação selecionados. "
+            "Clique novamente para cancelar.")
 
         self.pause_btn = ctk.CTkButton(
             f, text="⏸  Pausar", height=36, font=ctk.CTkFont(size=13),
@@ -1435,17 +1798,24 @@ class ShutdownApp:
             text_color=COLORS["text_dim"], corner_radius=8, state="disabled",
             command=self._pause_resume)
         self.pause_btn.pack(fill="x", padx=16, pady=(2, 14))
+        add_tooltip(self.pause_btn,
+            "Pausa ou retoma a contagem regressiva. "
+            "O timer continua de onde parou.")
 
     def _build_timer_controls(self, parent):
         f = ctk.CTkFrame(parent, fg_color="transparent")
         f.pack(fill="x", padx=20, pady=(0, 20))
-        ctk.CTkButton(
+        w_btn = ctk.CTkButton(
             f, text="⧉  Widget flutuante", height=36,
             font=ctk.CTkFont(size=13),
             fg_color=COLORS["surface"], hover_color=COLORS["surface2"],
             text_color=COLORS["text_dim"], corner_radius=8,
-            command=self._toggle_mini_widget
-        ).pack(fill="x")
+            command=self._toggle_mini_widget)
+        w_btn.pack(fill="x")
+        add_tooltip(w_btn,
+            "Exibe um mini-widget flutuante always-on-top com o timer. "
+            "Arraste-o para qualquer posição. "
+            "Clique com o botão direito para mais opções.")
 
     # ══════════════════════════════════════════════════════
     # ABA: PROGRAMAÇÃO
@@ -1751,12 +2121,20 @@ class ShutdownApp:
         self._cond_vars: Dict[str, tuple] = {}
 
         items = [
-            ("cpu_low",        "🖥  CPU cair abaixo de", "10", "% por 30s"),
-            ("process_closed", "⚙  Processo fechar:",    "",   "(ex: blender.exe)"),
-            ("download_done",  "📥  Download terminar",  "",   ""),
-            ("idle",           "🪑  Inativo por",         "30", "min"),
+            ("cpu_low",        "🖥  CPU cair abaixo de", "10", "% por 30s",
+             "Executa a ação quando o uso de CPU ficar abaixo deste valor por "
+             "30 segundos consecutivos. Ideal para aguardar o fim de renders ou encodes."),
+            ("process_closed", "⚙  Processo fechar:",    "",   "(ex: blender.exe)",
+             "Executa a ação quando o processo especificado for encerrado. "
+             "Útil para desligar após finalizar Blender, Handbrake, etc."),
+            ("download_done",  "📥  Download terminar",  "",   "",
+             "Monitora o tráfego de rede. Quando a taxa cair drasticamente "
+             "após um período de alta atividade, considera que o download terminou."),
+            ("idle",           "🪑  Inativo por",         "30", "min",
+             "Executa a ação após este tempo sem atividade de mouse ou teclado. "
+             "Bom para desligar automaticamente quando você esquece o PC ligado."),
         ]
-        for kind, prefix, default_val, suffix in items:
+        for kind, prefix, default_val, suffix, tip in items:
             sv   = saved.get(kind, {})
             card = ctk.CTkFrame(self._tab_cond,
                                 fg_color=COLORS["surface"], corner_radius=10)
@@ -1768,14 +2146,16 @@ class ShutdownApp:
             chk = ctk.BooleanVar(value=sv.get("enabled", False))
             par = tk.StringVar(value=sv.get("param", default_val))
 
-            ctk.CTkCheckBox(row, text=prefix, variable=chk,
+            cb = ctk.CTkCheckBox(row, text=prefix, variable=chk,
                             font=ctk.CTkFont(size=13), text_color=COLORS["text"],
                             checkbox_width=18, checkbox_height=18,
                             checkmark_color="white",
                             hover_color=COLORS["accent2"],
                             border_color=COLORS["border"],
                             fg_color=COLORS["accent2"]
-                            ).pack(side="left", padx=(0, 8))
+                            )
+            cb.pack(side="left", padx=(0, 8))
+            add_tooltip(cb, tip)
 
             if kind == "process_closed":
                 # Use process selector button
@@ -1817,6 +2197,10 @@ class ShutdownApp:
             text_color="white", corner_radius=10,
             command=self._toggle_conditional)
         self.cond_start_btn.pack(fill="x", padx=16, pady=(4, 16))
+        add_tooltip(self.cond_start_btn,
+            "Inicia o monitoramento das condições habilitadas acima. "
+            "Quando uma condição for satisfeita, a ação será executada "
+            "após um aviso de 15 segundos.")
 
     def _sel_cond_action(self, key: str):
         self.cond_action_var.set(key)
@@ -2051,21 +2435,198 @@ class ShutdownApp:
         # ── Geral ─────────────────────────────────────────
         f = self._card(scroll, "Geral")
         self.autostart_var = ctk.BooleanVar(value=self.config.get("autostart"))
-        self._switch(f, "🚀  Iniciar com o sistema", self.autostart_var,
+        sw_auto = self._switch(f, "🚀  Iniciar com o sistema", self.autostart_var,
                      cmd=self._toggle_autostart)
+        add_tooltip(sw_auto,
+            "Inicia o ShutdownTimer automaticamente quando o Windows/Linux iniciar.")
 
         self.prevent_sleep_var = ctk.BooleanVar(
             value=self.config.get("prevent_sleep"))
-        self._switch(
+        sw_sleep = self._switch(
             f, "⛔  Impedir hibernação durante o timer",
             self.prevent_sleep_var,
             cmd=lambda: self.config.set("prevent_sleep",
                                         self.prevent_sleep_var.get()))
+        add_tooltip(sw_sleep,
+            "Impede que o Windows entre em hibernação ou suspensão enquanto "
+            "o timer estiver contando. Restaurado automaticamente ao finalizar.")
+
+        # ── Smart Mode ────────────────────────────────────
+        fsm = self._card(scroll, "Smart Mode")
+
+        sm_top = ctk.CTkFrame(fsm, fg_color="transparent")
+        sm_top.pack(fill="x", padx=16, pady=(12, 4))
+
+        self.smart_mode_var = ctk.BooleanVar(value=self.config.get("smart_mode"))
+        sm_sw = ctk.CTkSwitch(
+            sm_top,
+            text=" 🧠  Smart Mode",
+            variable=self.smart_mode_var,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=COLORS["text"],
+            button_color=COLORS["accent2"],
+            progress_color=COLORS["accent2"],
+            onvalue=True, offvalue=False,
+            command=self._toggle_smart_mode)
+        sm_sw.pack(side="left")
+        add_tooltip(sm_sw,
+            "Gerencia automaticamente desligamento, suspensão e hibernação "
+            "com base na atividade do sistema e nos hábitos de uso aprendidos. "
+            "Inclui proteção de CPU, proteção de download e análise de padrões horários.")
+
+        self._smart_status_lbl = ctk.CTkLabel(
+            sm_top, text="",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["text_dim"])
+        self._smart_status_lbl.pack(side="right")
+
+        ctk.CTkLabel(fsm,
+            text="Gerenciamento inteligente de energia que aprende os hábitos "
+                 "de uso do computador.",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["text_dim2"],
+            wraplength=440, justify="left"
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # Sub-opções do Smart Mode (com tooltips)
+        sm_opts = ctk.CTkFrame(fsm, fg_color=COLORS["surface2"], corner_radius=8)
+        sm_opts.pack(fill="x", padx=16, pady=(0, 6))
+
+        # CPU threshold
+        cpu_row = ctk.CTkFrame(sm_opts, fg_color="transparent")
+        cpu_row.pack(fill="x", padx=12, pady=(10, 4))
+        cpu_lbl = ctk.CTkLabel(cpu_row, text="🖥  Proteção de CPU — pausar se CPU ≥",
+                               font=ctk.CTkFont(size=12),
+                               text_color=COLORS["text_dim"])
+        cpu_lbl.pack(side="left")
+        add_tooltip(cpu_lbl,
+            "Evita desligamento automático se o uso de CPU estiver acima "
+            "deste valor. Útil durante renders, backups e compilações.")
+        self._sm_cpu_var = tk.StringVar(
+            value=str(self.config.get("smart_cpu_threshold")))
+        cpu_entry = ctk.CTkEntry(cpu_row, textvariable=self._sm_cpu_var,
+                                 width=46, height=26,
+                                 font=ctk.CTkFont(size=11),
+                                 fg_color=COLORS["surface3"],
+                                 border_color=COLORS["border"],
+                                 corner_radius=5, text_color=COLORS["text"])
+        cpu_entry.pack(side="left", padx=6)
+        add_tooltip(cpu_entry,
+            "Percentual de CPU (0-100). Padrão: 15%.")
+        ctk.CTkLabel(cpu_row, text="%",
+                     font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim2"]).pack(side="left")
+
+        # Net threshold
+        net_row = ctk.CTkFrame(sm_opts, fg_color="transparent")
+        net_row.pack(fill="x", padx=12, pady=(0, 4))
+        net_lbl = ctk.CTkLabel(net_row,
+                               text="📥  Proteção de download — bloquear se rede ≥",
+                               font=ctk.CTkFont(size=12),
+                               text_color=COLORS["text_dim"])
+        net_lbl.pack(side="left")
+        add_tooltip(net_lbl,
+            "Evita desligamento enquanto downloads ou transferências de rede "
+            "estiverem ativos. O sistema aguarda a taxa cair abaixo do limite.")
+        self._sm_net_var = tk.StringVar(
+            value=str(self.config.get("smart_net_threshold_kb")))
+        net_entry = ctk.CTkEntry(net_row, textvariable=self._sm_net_var,
+                                 width=56, height=26,
+                                 font=ctk.CTkFont(size=11),
+                                 fg_color=COLORS["surface3"],
+                                 border_color=COLORS["border"],
+                                 corner_radius=5, text_color=COLORS["text"])
+        net_entry.pack(side="left", padx=6)
+        add_tooltip(net_entry,
+            "Taxa de rede em KB/s. Padrão: 100 KB/s.")
+        ctk.CTkLabel(net_row, text="KB/s",
+                     font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim2"]).pack(side="left")
+
+        # Idle thresholds
+        idle_row = ctk.CTkFrame(sm_opts, fg_color="transparent")
+        idle_row.pack(fill="x", padx=12, pady=(0, 4))
+        idle_lbl = ctk.CTkLabel(idle_row,
+                                text="🪑  Suspender após",
+                                font=ctk.CTkFont(size=12),
+                                text_color=COLORS["text_dim"])
+        idle_lbl.pack(side="left")
+        add_tooltip(idle_lbl,
+            "Suspende o computador após este tempo sem atividade de "
+            "mouse/teclado. Preserva a sessão.")
+        self._sm_suspend_var = tk.StringVar(
+            value=str(self.config.get("smart_idle_suspend_min")))
+        ctk.CTkEntry(idle_row, textvariable=self._sm_suspend_var,
+                     width=46, height=26,
+                     font=ctk.CTkFont(size=11),
+                     fg_color=COLORS["surface3"], border_color=COLORS["border"],
+                     corner_radius=5, text_color=COLORS["text"]
+                     ).pack(side="left", padx=6)
+        ctk.CTkLabel(idle_row, text="min · Desligar após",
+                     font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim"]).pack(side="left")
+        self._sm_shutdown_var = tk.StringVar(
+            value=str(self.config.get("smart_idle_shutdown_min")))
+        sh_entry = ctk.CTkEntry(idle_row, textvariable=self._sm_shutdown_var,
+                                width=46, height=26,
+                                font=ctk.CTkFont(size=11),
+                                fg_color=COLORS["surface3"],
+                                border_color=COLORS["border"],
+                                corner_radius=5, text_color=COLORS["text"])
+        sh_entry.pack(side="left", padx=6)
+        add_tooltip(sh_entry,
+            "Desliga o computador após este tempo de inatividade — apenas "
+            "se o Smart Mode prever que o usuário não voltará em breve.")
+        ctk.CTkLabel(idle_row, text="min de inatividade",
+                     font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim2"]).pack(side="left")
+
+        # Reboot suggestion
+        reboot_row = ctk.CTkFrame(sm_opts, fg_color="transparent")
+        reboot_row.pack(fill="x", padx=12, pady=(0, 10))
+        rb_lbl = ctk.CTkLabel(reboot_row,
+                              text="🔄  Sugerir reinicialização após",
+                              font=ctk.CTkFont(size=12),
+                              text_color=COLORS["text_dim"])
+        rb_lbl.pack(side="left")
+        add_tooltip(rb_lbl,
+            "Se o sistema estiver ligado por mais dias do que este limite, "
+            "o Smart Mode sugere uma reinicialização para melhorar a estabilidade.")
+        self._sm_uptime_var = tk.StringVar(
+            value=str(self.config.get("smart_uptime_reboot_d")))
+        ctk.CTkEntry(reboot_row, textvariable=self._sm_uptime_var,
+                     width=40, height=26,
+                     font=ctk.CTkFont(size=11),
+                     fg_color=COLORS["surface3"], border_color=COLORS["border"],
+                     corner_radius=5, text_color=COLORS["text"]
+                     ).pack(side="left", padx=6)
+        ctk.CTkLabel(reboot_row, text="dias ligado",
+                     font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim2"]).pack(side="left")
+
+        # Save smart config button
+        ctk.CTkButton(fsm, text="💾  Salvar configurações do Smart Mode",
+                      height=32, font=ctk.CTkFont(size=12),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
+                      text_color=COLORS["text_dim"], corner_radius=8,
+                      command=self._save_smart_config
+                      ).pack(fill="x", padx=16, pady=(0, 6))
+
+        # Hábitos button
+        ctk.CTkButton(fsm, text="📊  Ver hábitos aprendidos",
+                      height=32, font=ctk.CTkFont(size=12),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
+                      text_color=COLORS["text_dim"], corner_radius=8,
+                      command=self._show_smart_habits
+                      ).pack(fill="x", padx=16, pady=(0, 12))
 
         # ── Som e notificações ────────────────────────────
         f2 = self._card(scroll, "Som e notificações")
         self.sound_var = ctk.BooleanVar(value=self.config.get("sound_warning"))
-        self._switch(f2, "🔔  Beeps de aviso antes da ação", self.sound_var)
+        sw_sound = self._switch(f2, "🔔  Beeps de aviso antes da ação", self.sound_var)
+        add_tooltip(sw_sound,
+            "Emite beeps sonoros nos avisos de 5 min e 1 min antes da ação. "
+            "Quando desligado, apenas notificações visuais são enviadas.")
         if not HAS_PLYER:
             ctk.CTkLabel(f2, text="⚠  pip install plyer  para notificações nativas",
                          font=ctk.CTkFont(size=10),
@@ -2085,6 +2646,9 @@ class ShutdownApp:
                           self.config.set("hotkeys_enabled", self.hotkeys_var.get()),
                           self.hotkeys.setup(self.config, self)
                       )).pack(side="left")
+        add_tooltip(hkr,
+            "Ativa atalhos de teclado globais que funcionam mesmo com o "
+            "app minimizado. Requer 'pip install keyboard'.")
         if not HAS_KEYBOARD:
             ctk.CTkLabel(hkr, text="(pip install keyboard)",
                          font=ctk.CTkFont(size=10),
@@ -2116,11 +2680,16 @@ class ShutdownApp:
         self.gamer_var = ctk.BooleanVar(value=self.config.get("gamer_mode"))
         gr = ctk.CTkFrame(f4, fg_color="transparent")
         gr.pack(fill="x", padx=16, pady=(10, 6))
-        ctk.CTkSwitch(gr, text=" 🎮  Pausar timer quando jogo ativo",
+        gamer_sw = ctk.CTkSwitch(gr, text=" 🎮  Pausar timer quando jogo ativo",
                       variable=self.gamer_var, font=ctk.CTkFont(size=12),
                       text_color=COLORS["text_dim"],
                       button_color=COLORS["accent"], progress_color=COLORS["accent"],
-                      onvalue=True, offvalue=False).pack(side="left")
+                      onvalue=True, offvalue=False)
+        gamer_sw.pack(side="left")
+        add_tooltip(gamer_sw,
+            "Pausa automaticamente o timer quando detecta um jogo em fullscreen "
+            "ou um processo da lista monitorada em execução. Retoma quando o "
+            "jogo é fechado.")
         ctk.CTkButton(gr, text="⚙  Processos", width=100, height=28,
                       font=ctk.CTkFont(size=11),
                       fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
@@ -2157,11 +2726,16 @@ class ShutdownApp:
         self.adaptive_var = ctk.BooleanVar(value=self.config.get("adaptive_enabled"))
         ar = ctk.CTkFrame(f5, fg_color="transparent")
         ar.pack(fill="x", padx=16, pady=(10, 6))
-        ctk.CTkSwitch(ar, text=" 🖱  Detectar atividade e estender timer",
+        adapt_sw = ctk.CTkSwitch(ar, text=" 🖱  Detectar atividade e estender timer",
                       variable=self.adaptive_var, font=ctk.CTkFont(size=12),
                       text_color=COLORS["text_dim"],
                       button_color=COLORS["accent"], progress_color=COLORS["accent"],
-                      onvalue=True, offvalue=False).pack(side="left")
+                      onvalue=True, offvalue=False)
+        adapt_sw.pack(side="left")
+        add_tooltip(adapt_sw,
+            "Se o timer estiver nos últimos 2 minutos e houver atividade de "
+            "mouse/teclado, o timer é automaticamente estendido pelo valor "
+            "configurado. Evita desligar o PC enquanto você está usando.")
         self.adaptive_ext = tk.StringVar(
             value=str(self.config.get("adaptive_extend_min")))
         ctk.CTkEntry(ar, textvariable=self.adaptive_ext, width=46, height=24,
@@ -2677,10 +3251,185 @@ class ShutdownApp:
                 return
         self._quit_app()
 
+    # ── Smart Mode handlers ───────────────────────────────
+
+    def _toggle_smart_mode(self):
+        enabled = self.smart_mode_var.get()
+        self.config.set("smart_mode", enabled)
+        if enabled:
+            self._apply_smart_config()
+            self.smart.start()
+            self._smart_status_lbl.configure(
+                text="● ativo", text_color=COLORS["success"])
+            self.notif.send("Smart Mode ativado",
+                "O ShutdownTimer está monitorando o sistema automaticamente.")
+        else:
+            self.smart.stop()
+            self._smart_status_lbl.configure(text="", text_color=COLORS["text_dim"])
+
+    def _apply_smart_config(self):
+        """Lê as entradas da UI e aplica nos limites do SmartModeEngine."""
+        try:
+            self.smart.CPU_THRESHOLD = float(self._sm_cpu_var.get())
+        except (ValueError, AttributeError):
+            pass
+        try:
+            self.smart.NET_THRESHOLD_KB = float(self._sm_net_var.get())
+        except (ValueError, AttributeError):
+            pass
+        try:
+            self.smart.IDLE_SUSPEND_MIN = int(self._sm_suspend_var.get())
+        except (ValueError, AttributeError):
+            pass
+        try:
+            self.smart.IDLE_SHUTDOWN_MIN = int(self._sm_shutdown_var.get())
+        except (ValueError, AttributeError):
+            pass
+        try:
+            self.smart.UPTIME_REBOOT_DAYS = int(self._sm_uptime_var.get())
+        except (ValueError, AttributeError):
+            pass
+
+    def _save_smart_config(self):
+        """Persiste as configurações do Smart Mode."""
+        try:
+            self.config.set("smart_cpu_threshold",
+                            float(self._sm_cpu_var.get()))
+            self.config.set("smart_net_threshold_kb",
+                            float(self._sm_net_var.get()))
+            self.config.set("smart_idle_suspend_min",
+                            int(self._sm_suspend_var.get()))
+            self.config.set("smart_idle_shutdown_min",
+                            int(self._sm_shutdown_var.get()))
+            self.config.set("smart_uptime_reboot_d",
+                            int(self._sm_uptime_var.get()))
+            self._apply_smart_config()
+            self._smart_status_lbl.configure(
+                text="✓ salvo", text_color=COLORS["success"])
+            self.root.after(2000, lambda: self._smart_status_lbl.configure(
+                text="● ativo" if self.smart.is_running else "",
+                text_color=COLORS["success"] if self.smart.is_running
+                           else COLORS["text_dim"]))
+        except ValueError as e:
+            messagebox.showerror("Valor inválido",
+                f"Verifique os campos do Smart Mode:\n{e}")
+
+    def _on_smart_action(self, action: str, reason: str):
+        """Chamado quando Smart Mode decide executar uma ação."""
+        if self.engine.is_running:
+            return   # Timer manual tem prioridade
+        if self.smart.is_blocking:
+            return   # Proteção de rede/CPU ativa
+
+        label = ACTION_LABELS.get(action, action)
+        self.notif.send(
+            f"🧠 Smart Mode — {label}",
+            f"Motivo: {reason}\nA ação será executada em 15 segundos.")
+
+        cancelled = self._show_countdown_dialog(
+            action, f"Smart Mode: {label}\n{reason}")
+        if not cancelled:
+            self.config.add_history(action, 0, completed=True)
+            SystemController.execute(action)
+        else:
+            self._status(f"🧠 Smart Mode: ação '{label}' cancelada pelo usuário.",
+                         COLORS["warning"])
+
+    def _on_smart_suggestion(self, kind: str, msg: str):
+        """Chamado quando Smart Mode quer sugerir algo (ex: reboot)."""
+        self.notif.send("🧠 Smart Mode — Sugestão", msg)
+        # Também atualiza status na aba Opções se visível
+        if hasattr(self, "_smart_status_lbl"):
+            self._smart_status_lbl.configure(
+                text="💡 sugestão", text_color=COLORS["warning"])
+            self.root.after(5000, lambda: self._smart_status_lbl.configure(
+                text="● ativo" if self.smart.is_running else "",
+                text_color=COLORS["success"] if self.smart.is_running
+                           else COLORS["text_dim"]))
+
+    def _on_smart_status(self, snapshot: dict):
+        """Atualiza indicador de status do Smart Mode na UI."""
+        if not hasattr(self, "_smart_status_lbl"): return
+        if not self.smart.is_running: return
+
+        blocking = snapshot.get("blocking", False)
+        cpu      = snapshot.get("cpu", 0)
+        net      = snapshot.get("net_kb_s", 0)
+
+        if blocking:
+            txt   = f"⛔ bloqueado ({net:.0f} KB/s)"
+            color = COLORS["warning"]
+        elif cpu >= self.smart.CPU_THRESHOLD:
+            txt   = f"⏸ CPU alta ({cpu:.0f}%)"
+            color = COLORS["warning"]
+        else:
+            txt   = "● ativo"
+            color = COLORS["success"]
+
+        self._smart_status_lbl.configure(text=txt, text_color=color)
+
+    def _show_smart_habits(self):
+        """Janela com os hábitos de uso aprendidos pelo Smart Mode."""
+        rows = self.smart.get_habits_summary()
+
+        win = ctk.CTkToplevel(self.root)
+        win.title("🧠 Smart Mode — Hábitos aprendidos")
+        win.geometry("480x520")
+        win.configure(fg_color=COLORS["bg"]); win.grab_set()
+
+        ctk.CTkLabel(win, text="Padrões de uso por hora do dia",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=COLORS["text"]).pack(pady=(18, 4), padx=20, anchor="w")
+        ctk.CTkLabel(win,
+                     text="Dados acumulados com uso real. Mais amostras = previsões mais precisas.",
+                     font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim2"]).pack(padx=20, anchor="w", pady=(0, 10))
+
+        scroll = ctk.CTkScrollableFrame(win, fg_color=COLORS["bg"],
+                                        scrollbar_button_color=COLORS["surface2"])
+        scroll.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        # Header
+        hdr = ctk.CTkFrame(scroll, fg_color=COLORS["surface2"], corner_radius=6, height=28)
+        hdr.pack(fill="x", pady=(0, 4)); hdr.pack_propagate(False)
+        for txt, w in [("Hora", 55), ("Amostras", 75),
+                       ("CPU méd.", 75), ("Inativo", 80), ("Atividade", 100)]:
+            ctk.CTkLabel(hdr, text=txt, width=w,
+                         font=ctk.CTkFont(size=10, weight="bold"),
+                         text_color=COLORS["text_dim2"],
+                         anchor="center").pack(side="left", padx=2)
+
+        for r in rows:
+            pct    = r["active_pct"]
+            color  = (COLORS["success"]  if pct >= 60 else
+                      COLORS["warning"]  if pct >= 25 else
+                      COLORS["text_dim2"])
+            row_f = ctk.CTkFrame(scroll, fg_color=COLORS["surface"], corner_radius=6)
+            row_f.pack(fill="x", pady=2)
+
+            h_str = f"{r['hour']:02d}:00"
+            for txt, w in [
+                    (h_str,                     55),
+                    (str(r["samples"]),          75),
+                    (f"{r['avg_cpu']}%",         75),
+                    (f"{r['avg_idle_m']:.0f}min",80),
+                    (f"{pct:.0f}%",              100)]:
+                ctk.CTkLabel(row_f, text=txt, width=w,
+                             font=ctk.CTkFont(size=11),
+                             text_color=color if txt == f"{pct:.0f}%" else COLORS["text_dim"],
+                             anchor="center").pack(side="left", padx=4, pady=6)
+
+        # Nota sobre arquivo
+        habits_path = str(SmartModeEngine.HABITS_FILE)
+        ctk.CTkLabel(win, text=f"Arquivo: {habits_path}",
+                     font=ctk.CTkFont(size=9),
+                     text_color=COLORS["text_dim2"]).pack(pady=(0, 8))
+
     def _quit_app(self):
         self.engine.cancel()
         self.cond_mon.stop()
         self.scheduler.stop()
+        self.smart.stop()
         self.hotkeys.clear()
         SystemController.prevent_sleep(False)
         if self.mini: self.mini.hide()
