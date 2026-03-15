@@ -1,19 +1,21 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║              ShutdownTimer  v3.0                             ║
+║              ShutdownTimer  v4.0                             ║
 ║  Agendador inteligente de desligamento para Windows/Linux    ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Arquitetura (separação total de responsabilidades):         ║
-║   • SystemController  — ações de SO (shutdown/suspend/...)   ║
-║   • TimerEngine       — contagem regressiva thread-safe      ║
-║   • ConditionMonitor  — shutdown condicional (CPU/proc/net)  ║
-║   • ConfigManager     — persistência JSON                    ║
-║   • TrayManager       — ícone na bandeja do sistema          ║
-║   • NotificationManager — notificações nativas do SO         ║
-║   • HotkeyManager     — atalhos globais de teclado           ║
-║   • ShutdownApp       — janela principal (UI)                ║
-║   • MiniWidget        — widget flutuante compacto            ║
-║   • CLI               — modo linha de comando                ║
+║   • SystemController   — ações de SO + prevenir hibernação   ║
+║   • TimerEngine        — contagem regressiva thread-safe     ║
+║   • ConditionMonitor   — shutdown condicional                ║
+║   • SchedulerMonitor   — agendamento recorrente              ║
+║   • ConfigManager      — persistência JSON                   ║
+║   • TrayManager        — ícone na bandeja (duplo clique)     ║
+║   • NotificationManager— notificações inteligentes           ║
+║   • HotkeyManager      — atalhos globais                     ║
+║   • ProcessSelector    — gerenciador de processos            ║
+║   • ShutdownApp        — janela principal com abas           ║
+║   • MiniWidget         — widget flutuante compacto           ║
+║   • CLI                — modo linha de comando               ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Dependências obrigatórias:
@@ -22,8 +24,9 @@ Dependências obrigatórias:
 Dependências opcionais (degradam graciosamente se ausentes):
     pip install pystray pillow   # bandeja do sistema
     pip install plyer            # notificações nativas
-    pip install psutil           # shutdown condicional (CPU/processo/rede)
+    pip install psutil           # condicional / seletor processos
     pip install keyboard         # atalhos globais
+    pip install matplotlib       # gráficos na aba Relatórios
 """
 
 import os
@@ -31,6 +34,7 @@ import sys
 import csv
 import json
 import time
+import uuid
 import signal
 import argparse
 import platform
@@ -38,8 +42,8 @@ import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Callable, Optional
-from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional
+from dataclasses import dataclass, field
 
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
@@ -71,15 +75,62 @@ try:
 except ImportError:
     HAS_KEYBOARD = False
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
 
 # ══════════════════════════════════════════════════════════════
 # 1. SYSTEM CONTROLLER
 # ══════════════════════════════════════════════════════════════
 
 class SystemController:
-    """Executa ações de energia/sessão de forma segura e portável."""
+    """Executa ações de energia/sessão. Inclui prevenção de hibernação."""
 
-    PLATFORM = platform.system()  # 'Windows' | 'Linux' | 'Darwin'
+    PLATFORM = platform.system()
+
+    # -- Prevenção de hibernação (Windows) --
+    _ES_CONTINUOUS      = 0x80000000
+    _ES_SYSTEM_REQUIRED = 0x00000001
+    _sleep_inhibit_cookie: Optional[int] = None   # Linux systemd
+
+    @classmethod
+    def prevent_sleep(cls, enable: bool) -> bool:
+        """Ativa/desativa prevenção de hibernação enquanto o timer roda."""
+        try:
+            if cls.PLATFORM == "Windows":
+                import ctypes
+                if enable:
+                    ctypes.windll.kernel32.SetThreadExecutionState(
+                        cls._ES_CONTINUOUS | cls._ES_SYSTEM_REQUIRED)
+                else:
+                    ctypes.windll.kernel32.SetThreadExecutionState(
+                        cls._ES_CONTINUOUS)
+                return True
+            elif cls.PLATFORM == "Linux":
+                if enable:
+                    result = subprocess.Popen(
+                        ["systemd-inhibit", "--what=sleep:idle",
+                         "--who=ShutdownTimer", "--why=Timer ativo",
+                         "--mode=block", "sleep", "infinity"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    cls._sleep_inhibit_cookie = result.pid
+                else:
+                    if cls._sleep_inhibit_cookie:
+                        try:
+                            os.kill(cls._sleep_inhibit_cookie, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        cls._sleep_inhibit_cookie = None
+                return True
+        except Exception as e:
+            print(f"[SysCtrl] prevent_sleep({enable}): {e}")
+        return False
 
     @classmethod
     def shutdown(cls) -> bool:
@@ -96,7 +147,9 @@ class SystemController:
     def suspend(cls) -> bool:
         try:
             if cls.PLATFORM == "Windows":
-                subprocess.run(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], check=True)
+                subprocess.run(
+                    ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+                    check=True)
             elif cls.PLATFORM == "Linux":
                 subprocess.run(["systemctl", "suspend"], check=True)
             elif cls.PLATFORM == "Darwin":
@@ -120,25 +173,31 @@ class SystemController:
     def lock(cls) -> bool:
         try:
             if cls.PLATFORM == "Windows":
-                subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"], check=True)
+                subprocess.run(
+                    ["rundll32.exe", "user32.dll,LockWorkStation"], check=True)
             elif cls.PLATFORM == "Linux":
-                for cmd in [["loginctl", "lock-session"], ["xdg-screensaver", "lock"],
-                            ["gnome-screensaver-command", "--lock"], ["xscreensaver-command", "-lock"]]:
+                for cmd in [["loginctl", "lock-session"],
+                            ["xdg-screensaver", "lock"],
+                            ["gnome-screensaver-command", "--lock"],
+                            ["xscreensaver-command", "-lock"]]:
                     try:
-                        subprocess.run(cmd, check=True, timeout=3); return True
+                        subprocess.run(cmd, check=True, timeout=3)
+                        return True
                     except Exception:
                         continue
                 return False
             elif cls.PLATFORM == "Darwin":
-                subprocess.run(["osascript", "-e",
-                    'tell application "System Events" to keystroke "q" '
-                    'using {command down, control down}'], check=True)
+                subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to keystroke "q" '
+                     'using {command down, control down}'], check=True)
             return True
         except Exception as e:
             print(f"[SysCtrl] lock: {e}"); return False
 
     @classmethod
     def execute(cls, action: str) -> bool:
+        cls.prevent_sleep(False)   # restaura sempre antes de executar
         return {
             "shutdown": cls.shutdown, "suspend": cls.suspend,
             "reboot":   cls.reboot,   "lock":    cls.lock,
@@ -150,7 +209,8 @@ class SystemController:
             if cls.PLATFORM == "Windows":
                 import ctypes
                 class LII(ctypes.Structure):
-                    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+                    _fields_ = [("cbSize", ctypes.c_uint),
+                                 ("dwTime", ctypes.c_uint)]
                 lii = LII(); lii.cbSize = ctypes.sizeof(LII)
                 ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
                 return (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0
@@ -184,11 +244,10 @@ class SystemController:
     def is_fullscreen_active(cls) -> bool:
         if cls.PLATFORM != "Windows": return False
         try:
-            import ctypes
+            import ctypes, ctypes.wintypes
             user32 = ctypes.windll.user32
             hwnd = user32.GetForegroundWindow()
             if not hwnd: return False
-            import ctypes.wintypes
             rect = ctypes.wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rect))
             sw = user32.GetSystemMetrics(0); sh = user32.GetSystemMetrics(1)
@@ -199,8 +258,7 @@ class SystemController:
 
     @classmethod
     def set_autostart(cls, enable: bool) -> bool:
-        name = "ShutdownTimer"
-        app_path = sys.executable
+        name = "ShutdownTimer"; app_path = sys.executable
         try:
             if cls.PLATFORM == "Windows":
                 import winreg
@@ -214,8 +272,7 @@ class SystemController:
                 else:
                     try: winreg.DeleteValue(key, name)
                     except FileNotFoundError: pass
-                winreg.CloseKey(key)
-                return True
+                winreg.CloseKey(key); return True
             elif cls.PLATFORM == "Linux":
                 d = Path.home() / ".config" / "autostart"
                 d.mkdir(parents=True, exist_ok=True)
@@ -231,6 +288,61 @@ class SystemController:
         except Exception as e:
             print(f"[Autostart] {e}")
         return False
+
+    @classmethod
+    def get_process_list(cls) -> list:
+        """Retorna lista de processos com metadados. Requer psutil."""
+        if not HAS_PSUTIL: return []
+        procs = []
+        for p in psutil.process_iter(
+                ["pid", "name", "cpu_percent", "memory_info", "status"]):
+            try:
+                mi = p.info["memory_info"]
+                procs.append({
+                    "pid":    p.info["pid"],
+                    "name":   p.info["name"] or "",
+                    "cpu":    round(p.info["cpu_percent"] or 0, 1),
+                    "mem_mb": round((mi.rss if mi else 0) / 1024 / 1024, 1),
+                    "status": p.info["status"] or "",
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        procs.sort(key=lambda x: x["name"].lower())
+        return procs
+
+    @classmethod
+    def get_window_titles(cls) -> Dict[str, str]:
+        """Retorna dict {proc_name: window_title} para processos com janela visível."""
+        titles: Dict[str, str] = {}
+        if cls.PLATFORM == "Windows":
+            try:
+                import ctypes, ctypes.wintypes
+                EnumWindows = ctypes.windll.user32.EnumWindows
+                GetWindowText = ctypes.windll.user32.GetWindowTextW
+                IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+                GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
+
+                WNDENUMPROC = ctypes.WINFUNCTYPE(
+                    ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+
+                def enum_cb(hwnd, _):
+                    if IsWindowVisible(hwnd):
+                        buf = ctypes.create_unicode_buffer(512)
+                        GetWindowText(hwnd, buf, 512)
+                        if buf.value:
+                            pid = ctypes.c_ulong()
+                            GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                            try:
+                                name = psutil.Process(pid.value).name()
+                                titles[name] = buf.value
+                            except Exception:
+                                pass
+                    return True
+
+                EnumWindows(WNDENUMPROC(enum_cb), 0)
+            except Exception:
+                pass
+        return titles
 
 
 # ══════════════════════════════════════════════════════════════
@@ -248,11 +360,7 @@ class TimerState:
 
 
 class TimerEngine:
-    """
-    Motor de contagem regressiva desacoplado da UI.
-    Suporta pausa/retomada e extensão dinâmica.
-    Toda comunicação com a UI ocorre via callbacks.
-    """
+    """Motor de contagem regressiva desacoplado da UI."""
 
     def __init__(self):
         self._stop_event  = threading.Event()
@@ -349,7 +457,7 @@ class Condition:
 class ConditionMonitor:
     """Monitora condições do sistema e dispara ação quando satisfeitas."""
 
-    POLL = 5  # segundos
+    POLL = 5
 
     def __init__(self):
         self._stop  = threading.Event()
@@ -392,7 +500,7 @@ class ConditionMonitor:
             if name and not SystemController.is_process_running(name):
                 return True, f"Processo '{name}' encerrado"
         elif cond.kind == "download_done":
-            now = SystemController.get_net_bytes_recv()
+            now  = SystemController.get_net_bytes_recv()
             rate = (now - self._net_baseline) / self.POLL
             self._net_baseline = now
             min_rate = float(cond.param or "50000")
@@ -409,33 +517,89 @@ class ConditionMonitor:
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. CONFIG MANAGER
+# 4. SCHEDULER MONITOR  (agendamento recorrente)
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class ScheduledAction:
+    id:       str
+    enabled:  bool
+    action:   str
+    days:     List[int]          # 0=Segunda … 6=Domingo
+    hour:     int
+    minute:   int
+    last_run: Optional[str]      # ISO timestamp
+    name:     str
+
+
+class SchedulerMonitor:
+    """Verifica a cada minuto se alguma ação programada deve ser executada."""
+
+    POLL = 30   # segundos entre verificações
+
+    def __init__(self):
+        self._stop   = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.on_fire: Optional[Callable[[ScheduledAction], None]] = None
+
+    def start(self, get_actions: Callable[[], List[ScheduledAction]]):
+        if self._thread and self._thread.is_alive(): return
+        self._stop.clear()
+        self._get_actions = get_actions
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self): self._stop.set()
+
+    def _run(self):
+        while not self._stop.wait(self.POLL):
+            now = datetime.now()
+            for sa in self._get_actions():
+                if not sa.enabled: continue
+                if now.weekday() not in sa.days: continue
+                if now.hour != sa.hour or now.minute != sa.minute: continue
+                # Evita disparar mais de uma vez no mesmo minuto
+                ts = now.strftime("%Y-%m-%dT%H:%M")
+                if sa.last_run and sa.last_run.startswith(ts): continue
+                sa.last_run = now.isoformat(timespec="seconds")
+                if self.on_fire:
+                    self.on_fire(sa)
+
+
+# ══════════════════════════════════════════════════════════════
+# 5. CONFIG MANAGER
 # ══════════════════════════════════════════════════════════════
 
 class ConfigManager:
     DEFAULT: dict = {
-        "last_minutes":         30,
-        "last_action":          "shutdown",
-        "presets":              [15, 30, 60, 120],
-        "sound_warning":        False,
-        "gamer_mode":           False,
-        "gamer_idle_threshold": 30,
-        "gamer_processes":      [],
-        "adaptive_enabled":     False,
-        "adaptive_extend_min":  10,
-        "autostart":            False,
-        "hotkeys_enabled":      False,
-        "hotkey_start":         "ctrl+alt+s",
-        "hotkey_cancel":        "ctrl+alt+x",
-        "hotkey_widget":        "ctrl+alt+w",
-        "mini_widget_pos":      [50, 50],
-        "schedule_mode":        "countdown",
-        "schedule_hour":        23,
-        "schedule_minute":      30,
-        "cond_enabled":         True,
-        "cond_action":          "shutdown",
-        "conditions":           [],
-        "stats": {"total_completed": 0, "by_action": {}, "total_minutes": 0},
+        "last_minutes":           30,
+        "last_action":            "shutdown",
+        "presets":                [15, 30, 60, 120],
+        "sound_warning":          False,
+        "prevent_sleep":          False,
+        "gamer_mode":             False,
+        "gamer_idle_threshold":   30,
+        "gamer_processes":        [],
+        "adaptive_enabled":       False,
+        "adaptive_extend_min":    10,
+        "autostart":              False,
+        "hotkeys_enabled":        False,
+        "hotkey_start":           "ctrl+alt+s",
+        "hotkey_cancel":          "ctrl+alt+x",
+        "hotkey_widget":          "ctrl+alt+w",
+        "mini_widget_pos":        [50, 50],
+        "schedule_mode":          "countdown",
+        "schedule_hour":          23,
+        "schedule_minute":        30,
+        "cond_enabled":           True,
+        "cond_action":            "shutdown",
+        "conditions":             [],
+        "scheduled_actions":      [],
+        "stats": {
+            "total_completed": 0,
+            "by_action": {},
+            "total_minutes": 0
+        },
         "history": [],
     }
 
@@ -479,7 +643,7 @@ class ConfigManager:
     def add_history(self, action: str, minutes: int, completed: bool):
         self.data["history"].insert(0, {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "action": action, "minutes": minutes, "completed": completed
+            "action": action, "minutes": minutes, "completed": completed,
         })
         self.data["history"] = self.data["history"][:50]
         if completed:
@@ -489,30 +653,65 @@ class ConfigManager:
             s["by_action"][action] = s["by_action"].get(action, 0) + 1
         self.save()
 
+    def get_scheduled_actions(self) -> List[ScheduledAction]:
+        raw = self.data.get("scheduled_actions", [])
+        out = []
+        for r in raw:
+            try:
+                out.append(ScheduledAction(
+                    id       = r.get("id", str(uuid.uuid4())),
+                    enabled  = r.get("enabled", True),
+                    action   = r.get("action", "shutdown"),
+                    days     = r.get("days", list(range(7))),
+                    hour     = int(r.get("hour", 23)),
+                    minute   = int(r.get("minute", 0)),
+                    last_run = r.get("last_run"),
+                    name     = r.get("name", "Ação programada"),
+                ))
+            except Exception:
+                pass
+        return out
+
+    def save_scheduled_actions(self, actions: List[ScheduledAction]):
+        self.data["scheduled_actions"] = [
+            {"id": a.id, "enabled": a.enabled, "action": a.action,
+             "days": a.days, "hour": a.hour, "minute": a.minute,
+             "last_run": a.last_run, "name": a.name}
+            for a in actions]
+        self.save()
+
     def export_csv(self, path: str):
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["timestamp","action","minutes","completed"])
+            w = csv.DictWriter(
+                f, fieldnames=["timestamp","action","minutes","completed"])
             w.writeheader(); w.writerows(self.data["history"])
 
     def export_json(self, path: str):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.data["history"], f, indent=2, ensure_ascii=False)
 
-
 # ══════════════════════════════════════════════════════════════
-# 5. NOTIFICATION MANAGER
+# 6. NOTIFICATION MANAGER
 # ══════════════════════════════════════════════════════════════
 
 class NotificationManager:
+    """Notificações inteligentes: beeps opcionais, plyer sempre que disponível."""
+
     @staticmethod
     def send(title: str, message: str, timeout: int = 8):
+        """Envia notificação nativa. Funciona mesmo com app minimizado."""
         if HAS_PLYER:
             try:
                 plyer_notify.notify(title=title, message=message,
                                     app_name="ShutdownTimer", timeout=timeout)
                 return
             except Exception as e:
-                print(f"[Notify] {e}")
+                print(f"[Notify] plyer: {e}")
+
+    @staticmethod
+    def notify_only(title: str, message: str):
+        """Somente notificação visual, sem beeps."""
+        NotificationManager.send(title, message)
 
     @staticmethod
     def play_beeps():
@@ -527,9 +726,16 @@ class NotificationManager:
             except Exception as e: print(f"[Sound] {e}")
         threading.Thread(target=_do, daemon=True).start()
 
+    @classmethod
+    def warn(cls, title: str, message: str, sound: bool = False):
+        """Envia notificação. Se sound=True, adiciona beeps."""
+        cls.send(title, message)
+        if sound:
+            cls.play_beeps()
+
 
 # ══════════════════════════════════════════════════════════════
-# 6. TRAY MANAGER
+# 7. TRAY MANAGER  (duplo clique reabre janela)
 # ══════════════════════════════════════════════════════════════
 
 class TrayManager:
@@ -546,10 +752,8 @@ class TrayManager:
         bg   = "#4f8ef7" if active else "#1e2235"
         fg   = "white"   if active else "#7b82a8"
         draw.ellipse([2, 2, self.SZ-2, self.SZ-2], fill=bg)
-        # Símbolo de power simples
         cx, cy, r = self.SZ//2, self.SZ//2, 16
-        draw.arc([cx-r, cy-r, cx+r, cy+r], start=40, end=320,
-                 fill=fg, width=5)
+        draw.arc([cx-r, cy-r, cx+r, cy+r], start=40, end=320, fill=fg, width=5)
         draw.line([cx, cy-r, cx, cy-4], fill=fg, width=5)
         return img
 
@@ -558,28 +762,38 @@ class TrayManager:
         menu = pystray.Menu(
             pystray.MenuItem("⏻  ShutdownTimer", None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Abrir janela",
-                lambda: self._app.root.after(0, self._show_window)),
-            pystray.MenuItem("⧉  Widget compacto",
+            pystray.MenuItem(
+                "Abrir janela",
+                lambda: self._app.root.after(0, self._show_window),
+                default=True),      # ← item default = duplo clique
+            pystray.MenuItem(
+                "⧉  Widget compacto",
                 lambda: self._app.root.after(0, self._app._toggle_mini_widget)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("▶ Shutdown 30min",
+            pystray.MenuItem(
+                "▶ Shutdown 30min",
                 lambda: self._app.root.after(0, self._quick, "shutdown", 30)),
-            pystray.MenuItem("▶ Shutdown 1h",
+            pystray.MenuItem(
+                "▶ Shutdown 1h",
                 lambda: self._app.root.after(0, self._quick, "shutdown", 60)),
-            pystray.MenuItem("▶ Suspender 30min",
+            pystray.MenuItem(
+                "▶ Suspender 30min",
                 lambda: self._app.root.after(0, self._quick, "suspend", 30)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("⏹ Cancelar timer",
+            pystray.MenuItem(
+                "⏹ Cancelar timer",
                 lambda: self._app.root.after(0, self._app._cancel),
                 enabled=lambda item: self._app.engine.is_running),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("✕ Sair",
+            pystray.MenuItem(
+                "✕ Sair",
                 lambda: self._app.root.after(0, self._app._quit_app)),
         )
-        self._icon = pystray.Icon("ShutdownTimer",
-                                  icon=self._make_icon(False),
-                                  title="ShutdownTimer", menu=menu)
+        self._icon = pystray.Icon(
+            "ShutdownTimer",
+            icon=self._make_icon(False),
+            title="ShutdownTimer",
+            menu=menu)
         self._thread = threading.Thread(target=self._icon.run, daemon=True)
         self._thread.start()
 
@@ -616,7 +830,7 @@ class TrayManager:
 
 
 # ══════════════════════════════════════════════════════════════
-# 7. HOTKEY MANAGER
+# 8. HOTKEY MANAGER
 # ══════════════════════════════════════════════════════════════
 
 class HotkeyManager:
@@ -643,7 +857,191 @@ class HotkeyManager:
 
 
 # ══════════════════════════════════════════════════════════════
-# 8. CONSTANTS
+# 9. PROCESS SELECTOR  (Gerenciador de Processos)
+# ══════════════════════════════════════════════════════════════
+
+class ProcessSelector(ctk.CTkToplevel):
+    """
+    Janela de seleção de processos com duas abas:
+      - 🖥 Aplicativos  (processos com janela visível)
+      - ⚙  Processos   (todos os processos)
+    """
+
+    _proc_cache: list = []
+    _cache_ts: float  = 0
+    _CACHE_TTL        = 5.0
+
+    def __init__(self, parent, selected_processes: Optional[List[str]] = None,
+                 callback: Optional[Callable[[List[str]], None]] = None):
+        super().__init__(parent)
+        self.title("Gerenciador de Processos")
+        self.geometry("720x520")
+        self.configure(fg_color=COLORS["bg"])
+        self.resizable(True, True)
+        self.grab_set()
+
+        self.selected    = list(selected_processes or [])
+        self.callback    = callback
+        self._check_vars: Dict[str, tk.BooleanVar] = {}
+
+        self._build()
+        self._load_processes()
+
+    def _build(self):
+        # Header
+        hdr = ctk.CTkFrame(self, fg_color=COLORS["surface"], corner_radius=0, height=48)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        ctk.CTkLabel(hdr, text="⚙  Selecionar Processos",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=COLORS["text"]).pack(side="left", padx=16)
+        self._count_lbl = ctk.CTkLabel(hdr, text="",
+                                       font=ctk.CTkFont(size=12),
+                                       text_color=COLORS["accent"])
+        self._count_lbl.pack(side="right", padx=16)
+
+        # Tabview
+        self.tabview = ctk.CTkTabview(self, fg_color=COLORS["bg"],
+                                      segmented_button_fg_color=COLORS["surface"],
+                                      segmented_button_selected_color=COLORS["accent"],
+                                      segmented_button_unselected_color=COLORS["surface2"])
+        self.tabview.pack(fill="both", expand=True, padx=10, pady=(8, 0))
+
+        self._tab_apps  = self.tabview.add("🖥  Aplicativos")
+        self._tab_procs = self.tabview.add("⚙  Processos")
+
+        self._list_apps  = self._build_tab(self._tab_apps,  "apps")
+        self._list_procs = self._build_tab(self._tab_procs, "procs")
+
+        # Bottom bar
+        btm = ctk.CTkFrame(self, fg_color=COLORS["surface"], corner_radius=0, height=52)
+        btm.pack(fill="x"); btm.pack_propagate(False)
+        ctk.CTkButton(btm, text="✓  Confirmar", width=120, height=34,
+                      font=ctk.CTkFont(size=13, weight="bold"),
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+                      corner_radius=8, command=self._confirm
+                      ).pack(side="right", padx=12, pady=9)
+        ctk.CTkButton(btm, text="Cancelar", width=90, height=34,
+                      font=ctk.CTkFont(size=13),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
+                      corner_radius=8, command=self.destroy
+                      ).pack(side="right", padx=(0, 6), pady=9)
+        ctk.CTkButton(btm, text="↻  Atualizar", width=100, height=34,
+                      font=ctk.CTkFont(size=12),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
+                      corner_radius=8, command=self._load_processes
+                      ).pack(side="left", padx=12, pady=9)
+
+    def _build_tab(self, parent, tag: str) -> ctk.CTkScrollableFrame:
+        search_var = tk.StringVar()
+        search = ctk.CTkEntry(parent, textvariable=search_var,
+                              placeholder_text="🔍  Buscar processo...",
+                              height=34, font=ctk.CTkFont(size=12),
+                              fg_color=COLORS["surface2"], border_color=COLORS["border"],
+                              corner_radius=8, text_color=COLORS["text"])
+        search.pack(fill="x", padx=8, pady=(8, 4))
+
+        # Column headers
+        cols = ctk.CTkFrame(parent, fg_color=COLORS["surface2"], corner_radius=6, height=28)
+        cols.pack(fill="x", padx=8, pady=(0, 4)); cols.pack_propagate(False)
+        for txt, w in [("✓", 32), ("Processo", 200), ("Janela / Status", 180),
+                       ("CPU%", 60), ("Mem MB", 70)]:
+            ctk.CTkLabel(cols, text=txt, width=w, font=ctk.CTkFont(size=10),
+                         text_color=COLORS["text_dim2"], anchor="w"
+                         ).pack(side="left", padx=4)
+
+        frame = ctk.CTkScrollableFrame(parent, fg_color=COLORS["bg"],
+                                       scrollbar_button_color=COLORS["surface2"])
+        frame.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        # Store refs for filtering
+        setattr(self, f"_search_var_{tag}", search_var)
+        setattr(self, f"_frame_{tag}", frame)
+        search_var.trace_add("write",
+            lambda *_: self._filter(tag))
+        return frame
+
+    def _load_processes(self):
+        now = time.time()
+        if now - self._cache_ts < self._CACHE_TTL and self._proc_cache:
+            procs = self._proc_cache
+        else:
+            procs = SystemController.get_process_list()
+            ProcessSelector._proc_cache = procs
+            ProcessSelector._cache_ts   = now
+
+        win_titles = SystemController.get_window_titles() if HAS_PSUTIL else {}
+        self._all_procs  = procs
+        self._win_titles = win_titles
+        self._populate("apps",  [p for p in procs if p["name"] in win_titles])
+        self._populate("procs", procs)
+        self._update_count()
+
+    def _populate(self, tag: str, procs: list):
+        frame: ctk.CTkScrollableFrame = getattr(self, f"_frame_{tag}")
+        for w in frame.winfo_children(): w.destroy()
+
+        for p in procs:
+            name   = p["name"]
+            key    = name.lower()
+            title  = self._win_titles.get(name, p.get("status", ""))
+
+            row = ctk.CTkFrame(frame, fg_color=COLORS["surface"], corner_radius=6)
+            row.pack(fill="x", pady=2)
+
+            var = self._check_vars.setdefault(key, tk.BooleanVar(
+                value=(name.lower() in [s.lower() for s in self.selected])))
+
+            chk = ctk.CTkCheckBox(row, text="", variable=var, width=28,
+                                  checkbox_width=16, checkbox_height=16,
+                                  fg_color=COLORS["accent"],
+                                  hover_color=COLORS["accent"],
+                                  border_color=COLORS["border"],
+                                  checkmark_color="white",
+                                  command=self._update_count)
+            chk.pack(side="left", padx=(6, 0))
+
+            ctk.CTkLabel(row, text=name[:28], width=200,
+                         font=ctk.CTkFont(size=12), anchor="w",
+                         text_color=COLORS["text"]).pack(side="left", padx=4)
+            ctk.CTkLabel(row, text=(title[:24] if title else "—"), width=180,
+                         font=ctk.CTkFont(size=11), anchor="w",
+                         text_color=COLORS["text_dim"]).pack(side="left", padx=4)
+            ctk.CTkLabel(row, text=str(p["cpu"]), width=55,
+                         font=ctk.CTkFont(size=11), anchor="center",
+                         text_color=COLORS["text_dim"]).pack(side="left")
+            ctk.CTkLabel(row, text=str(p["mem_mb"]), width=65,
+                         font=ctk.CTkFont(size=11), anchor="center",
+                         text_color=COLORS["text_dim"]).pack(side="left")
+
+        setattr(self, f"_rows_{tag}", procs)
+
+    def _filter(self, tag: str):
+        query: str = getattr(self, f"_search_var_{tag}").get().lower()
+        rows: list = getattr(self, f"_rows_{tag}", [])
+        frame: ctk.CTkScrollableFrame = getattr(self, f"_frame_{tag}")
+        for w in frame.winfo_children(): w.destroy()
+        filtered = [p for p in rows if query in p["name"].lower()] if query else rows
+        # re-use populate with filtered list
+        old_rows = getattr(self, f"_rows_{tag}", [])
+        setattr(self, f"_rows_{tag}", filtered)
+        self._populate(tag, filtered)
+        setattr(self, f"_rows_{tag}", old_rows)
+
+    def _update_count(self):
+        n = sum(1 for v in self._check_vars.values() if v.get())
+        self._count_lbl.configure(
+            text=f"{n} selecionado{'s' if n != 1 else ''}")
+
+    def _confirm(self):
+        selected = [name for name, var in self._check_vars.items() if var.get()]
+        if self.callback:
+            self.callback(selected)
+        self.selected = selected
+        self.destroy()
+
+
+# ══════════════════════════════════════════════════════════════
+# 10. CONSTANTS
 # ══════════════════════════════════════════════════════════════
 
 COLORS = {
@@ -663,18 +1061,20 @@ COLORS = {
     "border":       "#2a2f4a",
 }
 
-ACTION_ICONS  = {"shutdown": "⏻", "suspend": "🌙", "reboot": "↺", "lock": "🔒"}
-ACTION_LABELS = {"shutdown": "Desligar", "suspend": "Suspender",
-                 "reboot": "Reiniciar",  "lock": "Bloquear"}
+ACTION_ICONS  = {
+    "shutdown": "⏻", "suspend": "🌙", "reboot": "↺", "lock": "🔒"}
+ACTION_LABELS = {
+    "shutdown": "Desligar", "suspend": "Suspender",
+    "reboot":   "Reiniciar",  "lock":   "Bloquear"}
+
+DAYS_PT = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
 
 
 # ══════════════════════════════════════════════════════════════
-# 9. MINI WIDGET
+# 11. MINI WIDGET
 # ══════════════════════════════════════════════════════════════
 
 class MiniWidget:
-    """Janelinha flutuante always-on-top com o timer em modo compacto."""
-
     def __init__(self, root, engine: TimerEngine, config: ConfigManager,
                  on_cancel: Callable, on_open: Callable):
         self._root, self._engine, self._config = root, engine, config
@@ -713,12 +1113,12 @@ class MiniWidget:
 
         menu = tk.Menu(self._win, tearoff=0, bg="#161923", fg="white",
                        activebackground="#4f8ef7")
-        menu.add_command(label="Abrir",           command=self._on_open)
-        menu.add_command(label="Cancelar timer",  command=self._on_cancel)
+        menu.add_command(label="Abrir",          command=self._on_open)
+        menu.add_command(label="Cancelar timer", command=self._on_cancel)
         menu.add_separator()
-        menu.add_command(label="Fechar widget",   command=self.hide)
-        self._win.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
-
+        menu.add_command(label="Fechar widget",  command=self.hide)
+        self._win.bind("<Button-3>",
+                       lambda e: menu.tk_popup(e.x_root, e.y_root))
         self.update()
 
     def hide(self):
@@ -731,11 +1131,13 @@ class MiniWidget:
         if not self._win or not self._win.winfo_exists(): return
         s = self._engine.state
         if s.running:
-            h = s.remaining // 3600; m = (s.remaining % 3600) // 60; sec = s.remaining % 60
+            h   = s.remaining // 3600
+            m   = (s.remaining % 3600) // 60
+            sec = s.remaining % 60
             txt   = f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
             icon  = ACTION_ICONS.get(s.action, "⏻")
-            color = "#f75a5a" if s.remaining <= 60 else (
-                    "#f7a94f" if s.remaining <= 300 else "#e8eaf6")
+            color = ("#f75a5a" if s.remaining <= 60 else
+                     "#f7a94f" if s.remaining <= 300 else "#e8eaf6")
             self._lbl.configure(text=txt,  fg=color)
             self._ico.configure(text=icon, fg=color)
         else:
@@ -748,36 +1150,37 @@ class MiniWidget:
     def _ds(self, e): self._dx, self._dy = e.x_root, e.y_root
     def _dm(self, e):
         if not self._win: return
-        dx, dy = e.x_root - self._dx, e.y_root - self._dy
-        x, y = self._win.winfo_x() + dx, self._win.winfo_y() + dy
+        dx = e.x_root - self._dx; dy = e.y_root - self._dy
+        x = self._win.winfo_x() + dx; y = self._win.winfo_y() + dy
         self._win.geometry(f"+{x}+{y}"); self._dx, self._dy = e.x_root, e.y_root
     def _de(self, e):
         if self._win:
             self._config.set("mini_widget_pos",
                              [self._win.winfo_x(), self._win.winfo_y()])
 
-
 # ══════════════════════════════════════════════════════════════
-# 10. MAIN APP
+# 12. MAIN APP
 # ══════════════════════════════════════════════════════════════
 
 class ShutdownApp:
-    """Interface principal. Toda comunicação com threads via root.after()."""
+    """Interface principal com 5 abas: Timer · Programação · Condicional · Relatórios · Opções"""
 
     def __init__(self, root: ctk.CTk):
-        self.root      = root
-        self.config    = ConfigManager()
-        self.engine    = TimerEngine()
-        self.cond_mon  = ConditionMonitor()
-        self.notif     = NotificationManager()
-        self.tray      = TrayManager(self)
-        self.hotkeys   = HotkeyManager()
+        self.root       = root
+        self.config     = ConfigManager()
+        self.engine     = TimerEngine()
+        self.cond_mon   = ConditionMonitor()
+        self.scheduler  = SchedulerMonitor()
+        self.notif      = NotificationManager()
+        self.tray       = TrayManager(self)
+        self.hotkeys    = HotkeyManager()
         self.mini: Optional[MiniWidget] = None
 
         self._gamer_id:     Optional[str] = None
         self._countdown_id: Optional[str] = None
         self._widget_tick:  Optional[str] = None
         self._cond_active = False
+        self._sched_actions: List[ScheduledAction] = []
 
         self._setup_callbacks()
         self._build_window()
@@ -787,8 +1190,13 @@ class ShutdownApp:
         self.tray.start()
         self.hotkeys.setup(self.config, self)
         self.mini = MiniWidget(self.root, self.engine, self.config,
-                               on_cancel=self._cancel, on_open=self._show_window)
+                               on_cancel=self._cancel,
+                               on_open=self._show_window)
         self._widget_loop()
+
+        # Start scheduler
+        self._sched_actions = self.config.get_scheduled_actions()
+        self.scheduler.start(lambda: self._sched_actions)
 
     # ── Callbacks ─────────────────────────────────────────
 
@@ -801,13 +1209,14 @@ class ShutdownApp:
         self.engine.on_paused    = lambda p: after(0, self._on_paused,    p)
         self.cond_mon.on_condition_met = lambda a, d: after(
             0, self._on_condition_met, a, d)
+        self.scheduler.on_fire = lambda sa: after(0, self._on_scheduled_fire, sa)
 
     # ── Janela ────────────────────────────────────────────
 
     def _build_window(self):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
-        W, H = 480, 770
+        W, H = 540, 720
         self.root.title("ShutdownTimer")
         self.root.geometry(f"{W}x{H}")
         self.root.resizable(False, False)
@@ -825,45 +1234,68 @@ class ShutdownApp:
     def _build_ui(self):
         # Header
         hdr = ctk.CTkFrame(self.root, fg_color=COLORS["surface"],
-                           corner_radius=0, height=56)
+                           corner_radius=0, height=52)
         hdr.pack(fill="x"); hdr.pack_propagate(False)
-
         ctk.CTkLabel(hdr, text="⏻  ShutdownTimer",
-                     font=ctk.CTkFont("Segoe UI", 18, "bold"),
-                     text_color=COLORS["text"]).pack(side="left", padx=20)
-
+                     font=ctk.CTkFont("Segoe UI", 17, "bold"),
+                     text_color=COLORS["text"]).pack(side="left", padx=18)
         hdr_r = ctk.CTkFrame(hdr, fg_color="transparent")
-        hdr_r.pack(side="right", padx=12)
+        hdr_r.pack(side="right", padx=10)
         ctk.CTkButton(hdr_r, text="⧉", width=32, height=28,
                       font=ctk.CTkFont(size=14),
                       fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
                       corner_radius=6, text_color=COLORS["text_dim"],
                       command=self._toggle_mini_widget).pack(side="right", padx=2)
-        ctk.CTkLabel(hdr, text=f"🖥 {SystemController.PLATFORM}",
+        ctk.CTkLabel(hdr, text=f"🖥  {SystemController.PLATFORM}",
                      font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_dim2"]).pack(side="right", padx=4)
 
-        # Corpo scrollável
-        self._body = ctk.CTkScrollableFrame(
-            self.root, fg_color=COLORS["bg"],
+        # Main tab view
+        self.tabs = ctk.CTkTabview(
+            self.root,
+            fg_color=COLORS["bg"],
+            segmented_button_fg_color=COLORS["surface"],
+            segmented_button_selected_color=COLORS["accent"],
+            segmented_button_selected_hover_color=COLORS["accent_hover"],
+            segmented_button_unselected_color=COLORS["surface2"],
+            segmented_button_unselected_hover_color=COLORS["surface3"],
+            text_color=COLORS["text"],
+            text_color_disabled=COLORS["text_dim2"])
+        self.tabs.pack(fill="both", expand=True, padx=0, pady=0)
+
+        self._tab_timer  = self.tabs.add("⏱  Timer")
+        self._tab_sched  = self.tabs.add("📅  Programação")
+        self._tab_cond   = self.tabs.add("🎯  Condicional")
+        self._tab_report = self.tabs.add("📊  Relatórios")
+        self._tab_opts   = self.tabs.add("⚙  Opções")
+
+        self._build_tab_timer()
+        self._build_tab_scheduling()
+        self._build_tab_conditional()
+        self._build_tab_reports()
+        self._build_tab_options()
+
+    # ══════════════════════════════════════════════════════
+    # ABA: TIMER
+    # ══════════════════════════════════════════════════════
+
+    def _build_tab_timer(self):
+        scroll = ctk.CTkScrollableFrame(
+            self._tab_timer, fg_color=COLORS["bg"],
             scrollbar_button_color=COLORS["surface2"],
             scrollbar_button_hover_color=COLORS["surface3"])
-        self._body.pack(fill="both", expand=True)
+        scroll.pack(fill="both", expand=True)
+        self._timer_body = scroll
 
-        self._build_mode_selector()
-        self._build_presets()
-        self._build_time_input()
-        self._build_action_selector()
-        self._build_timer_display()
-        self._build_options()
-        self._build_conditional()
-        self._build_controls()
-        self._build_bottom_bar()
+        self._build_mode_selector(scroll)
+        self._build_presets(scroll)
+        self._build_time_input(scroll)
+        self._build_action_selector(scroll)
+        self._build_timer_display(scroll)
+        self._build_timer_controls(scroll)
 
-    # ── Seções ────────────────────────────────────────────
-
-    def _build_mode_selector(self):
-        f = self._card("Modo")
+    def _build_mode_selector(self, parent):
+        f = self._card(parent, "Modo")
         self.mode_var = ctk.StringVar(value=self.config.get("schedule_mode"))
         row = ctk.CTkFrame(f, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=(14, 14))
@@ -871,15 +1303,16 @@ class ShutdownApp:
         for key, lbl in [("countdown", "⏱  Contagem regressiva"),
                          ("schedule",  "🕐  Horário específico")]:
             btn = ctk.CTkButton(
-                row, text=lbl, width=184, height=34,
+                row, text=lbl, width=190, height=34,
                 font=ctk.CTkFont(size=13), corner_radius=8,
                 fg_color=COLORS["surface2"], hover_color=COLORS["accent"],
-                text_color=COLORS["text"], command=lambda k=key: self._set_mode(k))
+                text_color=COLORS["text"],
+                command=lambda k=key: self._set_mode(k))
             btn.pack(side="left", padx=(0, 6))
             self._mode_btns[key] = btn
 
-    def _build_presets(self):
-        f = self._card("Presets rápidos")
+    def _build_presets(self, parent):
+        f = self._card(parent, "Presets rápidos")
         row = ctk.CTkFrame(f, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=(14, 14))
         for m in self.config.get("presets"):
@@ -892,14 +1325,13 @@ class ShutdownApp:
                 command=lambda v=m: self._apply_preset(v)
             ).pack(side="left", padx=(0, 6))
 
-    def _build_time_input(self):
-        f = self._card("")
+    def _build_time_input(self, parent):
+        f = self._card(parent, "")
         self._cd_frame = ctk.CTkFrame(f, fg_color="transparent")
         self._cd_frame.pack(fill="x", padx=16, pady=(0, 4))
         ctk.CTkLabel(self._cd_frame, text="Tempo (minutos)",
                      font=ctk.CTkFont(size=12),
                      text_color=COLORS["text_dim"]).pack(anchor="w", pady=(0, 6))
-
         self.time_var = tk.StringVar(value=str(self.config.get("last_minutes")))
         self.time_entry = ctk.CTkEntry(
             self._cd_frame, textvariable=self.time_var,
@@ -929,18 +1361,16 @@ class ShutdownApp:
                 ctk.CTkLabel(sr, text=":",
                              font=ctk.CTkFont(size=28, weight="bold"),
                              text_color=COLORS["text_dim"]).pack(side="left", padx=(0, 6))
-
         self._sched_info = ctk.CTkLabel(self._sc_frame, text="",
                                         font=ctk.CTkFont(size=11),
                                         text_color=COLORS["text_dim"])
         self._sched_info.pack(anchor="w", pady=(4, 0))
         for v in (self.sched_h, self.sched_m):
             v.trace_add("write", lambda *_: self._update_sched_info())
-
         ctk.CTkFrame(f, fg_color="transparent", height=8).pack()
 
-    def _build_action_selector(self):
-        f = self._card("Ação")
+    def _build_action_selector(self, parent):
+        f = self._card(parent, "Ação")
         self.action_var = ctk.StringVar(value=self.config.get("last_action"))
         grid = ctk.CTkFrame(f, fg_color="transparent")
         grid.pack(fill="x", padx=16, pady=(14, 14))
@@ -948,17 +1378,18 @@ class ShutdownApp:
         for idx, (key, label) in enumerate(ACTION_LABELS.items()):
             btn = ctk.CTkButton(
                 grid, text=f"{ACTION_ICONS[key]}  {label}",
-                width=186, height=36, font=ctk.CTkFont(size=13), corner_radius=8,
+                width=190, height=36, font=ctk.CTkFont(size=13), corner_radius=8,
                 fg_color=COLORS["surface2"], hover_color=COLORS["accent"],
-                text_color=COLORS["text"], command=lambda k=key: self._select_action(k))
+                text_color=COLORS["text"],
+                command=lambda k=key: self._select_action(k))
             r, c = divmod(idx, 2)
             btn.grid(row=r, column=c,
                      padx=(0, 8) if c == 0 else 0,
                      pady=(0, 8) if r == 0 else 0)
             self._action_buttons[key] = btn
 
-    def _build_timer_display(self):
-        f = self._card("")
+    def _build_timer_display(self, parent):
+        f = self._card(parent, "")
         self.progress_bar = ctk.CTkProgressBar(
             f, height=6, fg_color=COLORS["surface2"],
             progress_color=COLORS["accent"], corner_radius=3)
@@ -974,9 +1405,22 @@ class ShutdownApp:
         self.status_label = ctk.CTkLabel(
             f, text="Aguardando início",
             font=ctk.CTkFont(size=12), text_color=COLORS["text_dim"])
-        self.status_label.pack(pady=(2, 14))
+        self.status_label.pack(pady=(2, 8))
 
-        
+        # +5 min button row
+        row5 = ctk.CTkFrame(f, fg_color="transparent")
+        row5.pack(fill="x", padx=16, pady=(0, 4))
+        self.extend5_btn = ctk.CTkButton(
+            row5, text="+5 min", width=80, height=32,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
+            text_color=COLORS["text_dim"], corner_radius=8, state="disabled",
+            command=self._extend_5min)
+        self.extend5_btn.pack(side="left")
+        ctk.CTkLabel(row5, text="estende o timer em 5 min",
+                     font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim2"]).pack(side="left", padx=8)
+
         self.start_btn = ctk.CTkButton(
             f, text="▶  Iniciar", height=50,
             font=ctk.CTkFont(size=16, weight="bold"),
@@ -990,62 +1434,651 @@ class ShutdownApp:
             fg_color=COLORS["surface"], hover_color=COLORS["surface2"],
             text_color=COLORS["text_dim"], corner_radius=8, state="disabled",
             command=self._pause_resume)
-        self.pause_btn.pack(expand=True, fill="x", padx=16, pady=(2, 14))
+        self.pause_btn.pack(fill="x", padx=16, pady=(2, 14))
 
-    def _build_options(self):
-        f = self._card("Opções")
+    def _build_timer_controls(self, parent):
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+        f.pack(fill="x", padx=20, pady=(0, 20))
+        ctk.CTkButton(
+            f, text="⧉  Widget flutuante", height=36,
+            font=ctk.CTkFont(size=13),
+            fg_color=COLORS["surface"], hover_color=COLORS["surface2"],
+            text_color=COLORS["text_dim"], corner_radius=8,
+            command=self._toggle_mini_widget
+        ).pack(fill="x")
 
-        # Aviso sonoro
-        self.sound_var = ctk.BooleanVar(value=self.config.get("sound_warning"))
-        self._switch(f, "🔔  Aviso sonoro (beeps antes da ação)", self.sound_var)
+    # ══════════════════════════════════════════════════════
+    # ABA: PROGRAMAÇÃO
+    # ══════════════════════════════════════════════════════
 
-        # Modo gamer
-        self.gamer_var = ctk.BooleanVar(value=self.config.get("gamer_mode"))
-        gr = ctk.CTkFrame(f, fg_color="transparent")
-        gr.pack(fill="x", padx=16, pady=(0, 6))
-        ctk.CTkSwitch(gr, text="🎮  Modo Gamer (pausa se jogo ativo)",
-                      variable=self.gamer_var, font=ctk.CTkFont(size=12),
+    def _build_tab_scheduling(self):
+        top = ctk.CTkFrame(self._tab_sched, fg_color="transparent")
+        top.pack(fill="x", padx=16, pady=(12, 8))
+        ctk.CTkLabel(top, text="Ações programadas por dia da semana",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text"]).pack(side="left")
+        ctk.CTkButton(top, text="➕  Nova", width=90, height=30,
+                      font=ctk.CTkFont(size=12),
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+                      corner_radius=8, command=self._new_schedule
+                      ).pack(side="right")
+
+        self._sched_list_frame = ctk.CTkScrollableFrame(
+            self._tab_sched, fg_color=COLORS["bg"],
+            scrollbar_button_color=COLORS["surface2"])
+        self._sched_list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._refresh_schedule_list()
+
+    def _refresh_schedule_list(self):
+        for w in self._sched_list_frame.winfo_children():
+            w.destroy()
+        actions = self._sched_actions
+        if not actions:
+            ctk.CTkLabel(self._sched_list_frame,
+                         text="Nenhuma ação programada.\nClique em ➕ Nova para criar.",
+                         font=ctk.CTkFont(size=12),
+                         text_color=COLORS["text_dim2"]).pack(pady=40)
+            return
+        for sa in actions:
+            self._sched_card(self._sched_list_frame, sa)
+
+    def _sched_card(self, parent, sa: ScheduledAction):
+        card = ctk.CTkFrame(parent, fg_color=COLORS["surface"], corner_radius=10)
+        card.pack(fill="x", pady=4, padx=4)
+
+        top = ctk.CTkFrame(card, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=(10, 4))
+
+        en_var = ctk.BooleanVar(value=sa.enabled)
+        ctk.CTkSwitch(top, text="", variable=en_var, width=40,
+                      button_color=COLORS["accent"],
+                      progress_color=COLORS["accent"],
+                      onvalue=True, offvalue=False,
+                      command=lambda: self._toggle_schedule(sa, en_var.get())
+                      ).pack(side="left")
+
+        icon = ACTION_ICONS.get(sa.action, "⏻")
+        label_txt = ACTION_LABELS.get(sa.action, sa.action)
+        ctk.CTkLabel(top, text=f"{icon}  {sa.name}",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text"]).pack(side="left", padx=8)
+        ctk.CTkLabel(top, text=label_txt,
+                     font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim"]).pack(side="left")
+
+        # Edit / Delete buttons
+        ctk.CTkButton(top, text="✎", width=28, height=26,
+                      font=ctk.CTkFont(size=12),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
+                      corner_radius=6, text_color=COLORS["text_dim"],
+                      command=lambda: self._edit_schedule(sa)
+                      ).pack(side="right", padx=(4, 0))
+        ctk.CTkButton(top, text="✕", width=28, height=26,
+                      font=ctk.CTkFont(size=12),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["danger"],
+                      corner_radius=6, text_color=COLORS["danger"],
+                      command=lambda: self._delete_schedule(sa)
+                      ).pack(side="right")
+
+        # Days + time row
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.pack(fill="x", padx=12, pady=(0, 10))
+        time_str = f"{sa.hour:02d}:{sa.minute:02d}"
+        ctk.CTkLabel(bottom, text=f"🕐  {time_str}",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color=COLORS["accent"]).pack(side="left", padx=(0, 12))
+        for d in range(7):
+            is_on = d in sa.days
+            ctk.CTkLabel(bottom,
+                         text=DAYS_PT[d],
+                         width=32, height=22,
+                         font=ctk.CTkFont(size=10),
+                         corner_radius=5,
+                         fg_color=COLORS["accent"] if is_on else COLORS["surface2"],
+                         text_color="white" if is_on else COLORS["text_dim2"]
+                         ).pack(side="left", padx=2)
+
+        if sa.last_run:
+            ts = sa.last_run[:16].replace("T", " ")
+            ctk.CTkLabel(card, text=f"Última execução: {ts}",
+                         font=ctk.CTkFont(size=10),
+                         text_color=COLORS["text_dim2"]).pack(anchor="e", padx=12, pady=(0, 6))
+
+    def _new_schedule(self):
+        self._sched_form(None)
+
+    def _edit_schedule(self, sa: ScheduledAction):
+        self._sched_form(sa)
+
+    def _sched_form(self, sa: Optional[ScheduledAction]):
+        """Formulário de criação/edição de agendamento."""
+        is_new = sa is None
+        win = ctk.CTkToplevel(self.root)
+        win.title("Nova programação" if is_new else "Editar programação")
+        win.geometry("420x520")
+        win.configure(fg_color=COLORS["bg"]); win.grab_set()
+
+        scroll = ctk.CTkScrollableFrame(win, fg_color=COLORS["bg"])
+        scroll.pack(fill="both", expand=True)
+
+        def lbl(text):
+            ctk.CTkLabel(scroll, text=text, font=ctk.CTkFont(size=11),
+                         text_color=COLORS["text_dim"]).pack(anchor="w", padx=16, pady=(8, 2))
+
+        lbl("Nome")
+        name_var = tk.StringVar(value=sa.name if sa else "Minha programação")
+        ctk.CTkEntry(scroll, textvariable=name_var, height=36,
+                     font=ctk.CTkFont(size=13),
+                     fg_color=COLORS["surface2"], border_color=COLORS["border"],
+                     corner_radius=8, text_color=COLORS["text"]
+                     ).pack(fill="x", padx=16)
+
+        lbl("Ação")
+        action_var = ctk.StringVar(value=sa.action if sa else "shutdown")
+        act_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        act_frame.pack(fill="x", padx=16, pady=(0, 4))
+        act_btns = {}
+        for key, label in ACTION_LABELS.items():
+            btn = ctk.CTkButton(act_frame,
+                text=f"{ACTION_ICONS[key]}  {label}",
+                width=88, height=30, font=ctk.CTkFont(size=12), corner_radius=7,
+                fg_color=COLORS["surface2"], hover_color=COLORS["accent"],
+                text_color=COLORS["text"],
+                command=lambda k=key: _sel_action(k))
+            btn.pack(side="left", padx=(0, 4))
+            act_btns[key] = btn
+
+        def _sel_action(k):
+            action_var.set(k)
+            for ak, ab in act_btns.items():
+                ab.configure(fg_color=COLORS["accent"] if ak == k else COLORS["surface2"],
+                             text_color="white" if ak == k else COLORS["text"])
+        _sel_action(action_var.get())
+
+        lbl("Horário")
+        time_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        time_row.pack(fill="x", padx=16)
+        h_var = tk.StringVar(value=f"{sa.hour:02d}" if sa else "23")
+        m_var = tk.StringVar(value=f"{sa.minute:02d}" if sa else "00")
+        for var, ph in [(h_var, "HH"), (m_var, "MM")]:
+            ctk.CTkEntry(time_row, textvariable=var, placeholder_text=ph,
+                         width=64, height=40,
+                         font=ctk.CTkFont(size=18, weight="bold"),
+                         fg_color=COLORS["surface2"], border_color=COLORS["border"],
+                         corner_radius=8, text_color=COLORS["text"]
+                         ).pack(side="left", padx=(0, 4))
+            if ph == "HH":
+                ctk.CTkLabel(time_row, text=":",
+                             font=ctk.CTkFont(size=24, weight="bold"),
+                             text_color=COLORS["text_dim"]).pack(side="left", padx=(0, 4))
+
+        lbl("Dias da semana")
+        days_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        days_frame.pack(fill="x", padx=16, pady=(0, 4))
+        day_vars = []
+        existing_days = sa.days if sa else list(range(7))
+        for d in range(7):
+            var = tk.BooleanVar(value=d in existing_days)
+            day_vars.append(var)
+            btn_ref = [None]
+            def mk_toggle(dv=var, di=d, br=btn_ref):
+                def tog():
+                    dv.set(not dv.get())
+                    br[0].configure(
+                        fg_color=COLORS["accent"] if dv.get() else COLORS["surface2"],
+                        text_color="white" if dv.get() else COLORS["text_dim"])
+                return tog
+            b = ctk.CTkButton(days_frame, text=DAYS_PT[d],
+                              width=48, height=30, font=ctk.CTkFont(size=11),
+                              corner_radius=7,
+                              fg_color=COLORS["accent"] if d in existing_days else COLORS["surface2"],
+                              hover_color=COLORS["accent"],
+                              text_color="white" if d in existing_days else COLORS["text_dim"],
+                              command=mk_toggle())
+            b.pack(side="left", padx=2)
+            btn_ref[0] = b
+
+        en_var = ctk.BooleanVar(value=sa.enabled if sa else True)
+        ctk.CTkSwitch(scroll, text=" Ativada",
+                      variable=en_var, font=ctk.CTkFont(size=12),
                       text_color=COLORS["text_dim"],
                       button_color=COLORS["accent"],
                       progress_color=COLORS["accent"],
-                      onvalue=True, offvalue=False).pack(side="left")
-        ctk.CTkButton(gr, text="⚙", width=28, height=22,
+                      onvalue=True, offvalue=False
+                      ).pack(anchor="w", padx=16, pady=(10, 4))
+
+        def save():
+            try:
+                h = int(h_var.get()); m = int(m_var.get())
+                assert 0 <= h <= 23 and 0 <= m <= 59
+            except Exception:
+                messagebox.showerror("Horário inválido",
+                    "Digite um horário válido (HH:MM).", parent=win)
+                return
+            days = [d for d, v in enumerate(day_vars) if v.get()]
+            if not days:
+                messagebox.showwarning("Dias", "Selecione ao menos um dia.", parent=win)
+                return
+            if is_new:
+                self._sched_actions.append(ScheduledAction(
+                    id=str(uuid.uuid4()), enabled=en_var.get(),
+                    action=action_var.get(), days=days,
+                    hour=h, minute=m, last_run=None, name=name_var.get()))
+            else:
+                sa.name    = name_var.get()
+                sa.action  = action_var.get()
+                sa.days    = days
+                sa.hour    = h; sa.minute = m
+                sa.enabled = en_var.get()
+            self.config.save_scheduled_actions(self._sched_actions)
+            self._refresh_schedule_list()
+            win.destroy()
+
+        ctk.CTkButton(scroll, text="💾  Salvar", height=40,
+                      font=ctk.CTkFont(size=14, weight="bold"),
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+                      corner_radius=8, command=save
+                      ).pack(fill="x", padx=16, pady=12)
+
+    def _delete_schedule(self, sa: ScheduledAction):
+        if not messagebox.askyesno("Excluir",
+                f"Excluir '{sa.name}'?"):
+            return
+        self._sched_actions = [x for x in self._sched_actions if x.id != sa.id]
+        self.config.save_scheduled_actions(self._sched_actions)
+        self._refresh_schedule_list()
+
+    def _toggle_schedule(self, sa: ScheduledAction, enabled: bool):
+        sa.enabled = enabled
+        self.config.save_scheduled_actions(self._sched_actions)
+        self._refresh_schedule_list()
+
+    def _on_scheduled_fire(self, sa: ScheduledAction):
+        label = ACTION_LABELS.get(sa.action, sa.action)
+        self.notif.send(f"📅  {sa.name}",
+                        f"{label} em 15 segundos (agendamento recorrente).")
+        cancelled = self._show_countdown_dialog(sa.action,
+                                                f"{sa.name}  — {label}")
+        if not cancelled:
+            self.config.add_history(sa.action, 0, completed=True)
+            SystemController.execute(sa.action)
+        self.config.save_scheduled_actions(self._sched_actions)
+        self._refresh_schedule_list()
+
+    # ══════════════════════════════════════════════════════
+    # ABA: CONDICIONAL
+    # ══════════════════════════════════════════════════════
+
+    def _build_tab_conditional(self):
+        top = ctk.CTkFrame(self._tab_cond, fg_color="transparent")
+        top.pack(fill="x", padx=16, pady=(14, 4))
+        ctk.CTkLabel(top,
+                     text="Desligar automaticamente quando uma condição for satisfeita",
+                     font=ctk.CTkFont(size=12),
+                     text_color=COLORS["text_dim"]).pack(anchor="w")
+
+        if not HAS_PSUTIL:
+            ctk.CTkFrame(self._tab_cond,
+                         fg_color=COLORS["surface"], corner_radius=10,
+                         height=60).pack(fill="x", padx=16, pady=8)
+            ctk.CTkLabel(self._tab_cond,
+                         text="⚠  Instale psutil para usar o shutdown condicional\n"
+                              "pip install psutil",
+                         font=ctk.CTkFont(size=12), text_color=COLORS["warning"]
+                         ).pack(pady=20)
+            self.cond_start_btn = None
+            return
+
+        # Ação condicional
+        cf = self._card(self._tab_cond, "Ação ao detectar condição")
+        self.cond_action_var = ctk.StringVar(value=self.config.get("cond_action"))
+        act_frame = ctk.CTkFrame(cf, fg_color="transparent")
+        act_frame.pack(fill="x", padx=16, pady=(12, 12))
+        self._cond_act_btns = {}
+        for key, label in ACTION_LABELS.items():
+            btn = ctk.CTkButton(
+                act_frame, text=f"{ACTION_ICONS[key]}  {label}",
+                width=105, height=34, font=ctk.CTkFont(size=12), corner_radius=8,
+                fg_color=COLORS["surface2"], hover_color=COLORS["accent2"],
+                text_color=COLORS["text"],
+                command=lambda k=key: self._sel_cond_action(k))
+            btn.pack(side="left", padx=(0, 6))
+            self._cond_act_btns[key] = btn
+        self._sel_cond_action(self.cond_action_var.get())
+
+        # Condição: CPU
+        saved = {c.get("kind",""): c for c in self.config.get("conditions")}
+        self._cond_vars: Dict[str, tuple] = {}
+
+        items = [
+            ("cpu_low",        "🖥  CPU cair abaixo de", "10", "% por 30s"),
+            ("process_closed", "⚙  Processo fechar:",    "",   "(ex: blender.exe)"),
+            ("download_done",  "📥  Download terminar",  "",   ""),
+            ("idle",           "🪑  Inativo por",         "30", "min"),
+        ]
+        for kind, prefix, default_val, suffix in items:
+            sv   = saved.get(kind, {})
+            card = ctk.CTkFrame(self._tab_cond,
+                                fg_color=COLORS["surface"], corner_radius=10)
+            card.pack(fill="x", padx=16, pady=(0, 8))
+
+            row = ctk.CTkFrame(card, fg_color="transparent")
+            row.pack(fill="x", padx=14, pady=12)
+
+            chk = ctk.BooleanVar(value=sv.get("enabled", False))
+            par = tk.StringVar(value=sv.get("param", default_val))
+
+            ctk.CTkCheckBox(row, text=prefix, variable=chk,
+                            font=ctk.CTkFont(size=13), text_color=COLORS["text"],
+                            checkbox_width=18, checkbox_height=18,
+                            checkmark_color="white",
+                            hover_color=COLORS["accent2"],
+                            border_color=COLORS["border"],
+                            fg_color=COLORS["accent2"]
+                            ).pack(side="left", padx=(0, 8))
+
+            if kind == "process_closed":
+                # Use process selector button
+                proc_lbl = ctk.CTkLabel(row, textvariable=par,
+                                        font=ctk.CTkFont(size=11),
+                                        text_color=COLORS["text_dim"],
+                                        width=140, anchor="w")
+                proc_lbl.pack(side="left", padx=(0, 6))
+                ctk.CTkButton(row, text="⚙", width=30, height=24,
+                              font=ctk.CTkFont(size=11),
+                              fg_color=COLORS["surface2"],
+                              hover_color=COLORS["surface3"],
+                              corner_radius=6, text_color=COLORS["text_dim"],
+                              command=lambda p=par: self._pick_process_cond(p)
+                              ).pack(side="left")
+            elif default_val:
+                ctk.CTkEntry(row, textvariable=par, width=56, height=26,
+                             font=ctk.CTkFont(size=12),
+                             fg_color=COLORS["surface2"],
+                             border_color=COLORS["border"],
+                             corner_radius=6, text_color=COLORS["text"]
+                             ).pack(side="left", padx=(0, 6))
+                if suffix:
+                    ctk.CTkLabel(row, text=suffix, font=ctk.CTkFont(size=11),
+                                 text_color=COLORS["text_dim2"]).pack(side="left")
+
+            self._cond_vars[kind] = (chk, par)
+
+        # Monitor button + status
+        self._cond_status_lbl = ctk.CTkLabel(
+            self._tab_cond, text="",
+            font=ctk.CTkFont(size=12), text_color=COLORS["text_dim"])
+        self._cond_status_lbl.pack(pady=(4, 2))
+
+        self.cond_start_btn = ctk.CTkButton(
+            self._tab_cond, text="▶  Ativar monitoramento",
+            height=42, font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=COLORS["accent2"], hover_color="#6a4ce0",
+            text_color="white", corner_radius=10,
+            command=self._toggle_conditional)
+        self.cond_start_btn.pack(fill="x", padx=16, pady=(4, 16))
+
+    def _sel_cond_action(self, key: str):
+        self.cond_action_var.set(key)
+        for k, btn in self._cond_act_btns.items():
+            btn.configure(
+                fg_color=COLORS["accent2"] if k == key else COLORS["surface2"],
+                text_color="white" if k == key else COLORS["text"])
+
+    def _pick_process_cond(self, par_var: tk.StringVar):
+        current = [p.strip() for p in par_var.get().split(",") if p.strip()]
+        def cb(selected):
+            par_var.set(", ".join(selected))
+        ProcessSelector(self.root, selected_processes=current, callback=cb)
+
+    # ══════════════════════════════════════════════════════
+    # ABA: RELATÓRIOS
+    # ══════════════════════════════════════════════════════
+
+    def _build_tab_reports(self):
+        scroll = ctk.CTkScrollableFrame(
+            self._tab_report, fg_color=COLORS["bg"],
+            scrollbar_button_color=COLORS["surface2"])
+        scroll.pack(fill="both", expand=True)
+        self._report_body = scroll
+        self._build_stats_cards(scroll)
+        self._build_charts(scroll)
+        self._build_history_table(scroll)
+
+    def _build_stats_cards(self, parent):
+        s      = self.config.get("stats") or {}
+        total  = s.get("total_completed", 0)
+        mins   = s.get("total_minutes", 0)
+        kwh    = round(mins * 0.05 / 60, 1)          # ~50W estimado
+        co2    = round(kwh * 0.5, 1)                  # ~0.5 kg/kWh
+
+        cards_data = [
+            ("⚡", "Ações concluídas", str(total),    COLORS["accent"]),
+            ("⏱",  "Minutos agendados", str(mins),    COLORS["accent2"]),
+            ("💡", "Energia estimada",  f"~{kwh} kWh", COLORS["warning"]),
+            ("🌿", "CO₂ evitado",       f"~{co2} kg",  COLORS["success"]),
+        ]
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+        f.pack(fill="x", padx=16, pady=(16, 8))
+        ctk.CTkLabel(f, text="Resumo", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text"]).pack(anchor="w", pady=(0, 8))
+        grid = ctk.CTkFrame(f, fg_color="transparent")
+        grid.pack(fill="x")
+        for col, (icon, lbl, val, col_) in enumerate(cards_data):
+            card = ctk.CTkFrame(grid, fg_color=COLORS["surface"], corner_radius=10)
+            card.grid(row=0, column=col, padx=(0, 8) if col < 3 else 0, sticky="ew")
+            grid.grid_columnconfigure(col, weight=1)
+            ctk.CTkLabel(card, text=icon, font=ctk.CTkFont(size=22)
+                         ).pack(pady=(12, 0))
+            ctk.CTkLabel(card, text=val,
+                         font=ctk.CTkFont(size=18, weight="bold"),
+                         text_color=col_).pack()
+            ctk.CTkLabel(card, text=lbl, font=ctk.CTkFont(size=10),
+                         text_color=COLORS["text_dim2"]).pack(pady=(0, 10))
+
+    def _build_charts(self, parent):
+        if not HAS_MATPLOTLIB:
+            card = ctk.CTkFrame(parent, fg_color=COLORS["surface"], corner_radius=10)
+            card.pack(fill="x", padx=16, pady=8)
+            ctk.CTkLabel(card,
+                         text="📊  Instale matplotlib para ver gráficos\n"
+                              "pip install matplotlib",
+                         font=ctk.CTkFont(size=12),
+                         text_color=COLORS["warning"]).pack(pady=20)
+            return
+
+        s      = self.config.get("stats") or {}
+        by_a   = s.get("by_action", {})
+        history = self.config.get("history") or []
+
+        if not by_a and not history:
+            return
+
+        plt.style.use("dark_background")
+
+        # -- Pie chart: ações por tipo --
+        if by_a:
+            fig1, ax1 = plt.subplots(figsize=(4.5, 3))
+            fig1.patch.set_facecolor("#161923")
+            ax1.set_facecolor("#161923")
+            labels = [ACTION_LABELS.get(k, k) for k in by_a]
+            sizes  = list(by_a.values())
+            colors = ["#4f8ef7", "#7c5cf7", "#f7a94f", "#4ff78e"]
+            ax1.pie(sizes, labels=labels, colors=colors[:len(sizes)],
+                    autopct="%1.0f%%", startangle=140,
+                    textprops={"color": "#e8eaf6", "fontsize": 9})
+            ax1.set_title("Ações por tipo",
+                          color="#e8eaf6", fontsize=11, pad=8)
+            fig1.tight_layout()
+
+            card1 = ctk.CTkFrame(parent, fg_color=COLORS["surface"], corner_radius=10)
+            card1.pack(fill="x", padx=16, pady=(0, 8))
+            ctk.CTkLabel(card1, text="Distribuição de ações",
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=COLORS["text"]).pack(anchor="w", padx=12, pady=(10, 0))
+            canvas1 = FigureCanvasTkAgg(fig1, master=card1)
+            canvas1.draw()
+            canvas1.get_tk_widget().pack(fill="x", padx=8, pady=8)
+            plt.close(fig1)
+
+        # -- Bar chart: ações por dia da semana (últimos 30 dias) --
+        if history:
+            day_counts = [0] * 7
+            cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+            for e in history:
+                if e.get("timestamp", "") < cutoff: continue
+                if not e.get("completed"): continue
+                try:
+                    d = datetime.fromisoformat(e["timestamp"]).weekday()
+                    day_counts[d] += 1
+                except Exception:
+                    pass
+
+            if any(day_counts):
+                fig2, ax2 = plt.subplots(figsize=(4.5, 2.8))
+                fig2.patch.set_facecolor("#161923")
+                ax2.set_facecolor("#161923")
+                bars = ax2.bar(DAYS_PT, day_counts, color="#4f8ef7", width=0.6)
+                for bar in bars:
+                    if bar.get_height() > 0:
+                        ax2.text(bar.get_x() + bar.get_width() / 2,
+                                 bar.get_height() + 0.05,
+                                 str(int(bar.get_height())),
+                                 ha="center", va="bottom",
+                                 color="#e8eaf6", fontsize=8)
+                ax2.set_title("Ações por dia (últimos 30 dias)",
+                              color="#e8eaf6", fontsize=11)
+                ax2.tick_params(colors="#7b82a8")
+                ax2.spines["bottom"].set_color("#2a2f4a")
+                ax2.spines["left"].set_color("#2a2f4a")
+                ax2.spines["top"].set_visible(False)
+                ax2.spines["right"].set_visible(False)
+                fig2.tight_layout()
+
+                card2 = ctk.CTkFrame(parent, fg_color=COLORS["surface"], corner_radius=10)
+                card2.pack(fill="x", padx=16, pady=(0, 8))
+                ctk.CTkLabel(card2, text="Frequência semanal",
+                             font=ctk.CTkFont(size=12, weight="bold"),
+                             text_color=COLORS["text"]).pack(anchor="w", padx=12, pady=(10, 0))
+                canvas2 = FigureCanvasTkAgg(fig2, master=card2)
+                canvas2.draw()
+                canvas2.get_tk_widget().pack(fill="x", padx=8, pady=8)
+                plt.close(fig2)
+
+    def _build_history_table(self, parent):
+        hdr_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        hdr_frame.pack(fill="x", padx=16, pady=(8, 4))
+        ctk.CTkLabel(hdr_frame, text="Histórico de ações",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text"]).pack(side="left")
+
+        btn_frame = ctk.CTkFrame(hdr_frame, fg_color="transparent")
+        btn_frame.pack(side="right")
+        ctk.CTkButton(btn_frame, text="📄 CSV", width=64, height=28,
                       font=ctk.CTkFont(size=11),
                       fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
-                      corner_radius=5, text_color=COLORS["text_dim"],
-                      command=self._gamer_settings).pack(side="right")
+                      corner_radius=7, command=lambda: self._export_history("csv")
+                      ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btn_frame, text="{} JSON", width=70, height=28,
+                      font=ctk.CTkFont(size=11),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
+                      corner_radius=7, command=lambda: self._export_history("json")
+                      ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btn_frame, text="🗑 Limpar", width=74, height=28,
+                      font=ctk.CTkFont(size=11),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["danger"],
+                      text_color=COLORS["danger"], corner_radius=7,
+                      command=self._clear_history
+                      ).pack(side="left")
 
-        # Extensão adaptativa
-        self.adaptive_var = ctk.BooleanVar(value=self.config.get("adaptive_enabled"))
-        ar = ctk.CTkFrame(f, fg_color="transparent")
-        ar.pack(fill="x", padx=16, pady=(0, 6))
-        ctk.CTkSwitch(ar, text="🖱  Timer adaptativo (atividade → +X min)",
-                      variable=self.adaptive_var, font=ctk.CTkFont(size=12),
-                      text_color=COLORS["text_dim"],
-                      button_color=COLORS["accent"],
-                      progress_color=COLORS["accent"],
-                      onvalue=True, offvalue=False).pack(side="left")
-        self.adaptive_ext = tk.StringVar(value=str(self.config.get("adaptive_extend_min")))
-        ctk.CTkEntry(ar, textvariable=self.adaptive_ext, width=42, height=22,
-                     font=ctk.CTkFont(size=11),
+        # Filter
+        flt = ctk.CTkFrame(parent, fg_color="transparent")
+        flt.pack(fill="x", padx=16, pady=(0, 4))
+        self._hist_filter = tk.StringVar()
+        ctk.CTkEntry(flt, textvariable=self._hist_filter,
+                     placeholder_text="🔍  Filtrar por ação ou data...",
+                     height=30, font=ctk.CTkFont(size=11),
                      fg_color=COLORS["surface2"], border_color=COLORS["border"],
-                     corner_radius=5, text_color=COLORS["text"]).pack(side="right")
-        ctk.CTkLabel(ar, text="min", font=ctk.CTkFont(size=11),
-                     text_color=COLORS["text_dim"]).pack(side="right", padx=2)
+                     corner_radius=7, text_color=COLORS["text"]
+                     ).pack(fill="x")
+        self._hist_filter.trace_add("write", lambda *_: self._refresh_history())
 
-        # Autostart
+        self._hist_frame = ctk.CTkScrollableFrame(
+            parent, fg_color=COLORS["bg"], height=200,
+            scrollbar_button_color=COLORS["surface2"])
+        self._hist_frame.pack(fill="x", padx=16, pady=(0, 16))
+        self._refresh_history()
+
+    def _refresh_history(self):
+        for w in self._hist_frame.winfo_children(): w.destroy()
+        history = self.config.get("history") or []
+        query   = self._hist_filter.get().lower() if hasattr(self, "_hist_filter") else ""
+        for e in history:
+            action = e.get("action", "")
+            ts     = e.get("timestamp", "")[:16].replace("T", " ")
+            if query and query not in action.lower() and query not in ts:
+                continue
+            label  = ACTION_LABELS.get(action, action)
+            done   = e.get("completed", False)
+            color  = COLORS["success"] if done else COLORS["danger"]
+            mark   = "✓" if done else "✗"
+            row = ctk.CTkFrame(self._hist_frame,
+                               fg_color=COLORS["surface"], corner_radius=6)
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row,
+                text=f"{mark}  {label} ({e.get('minutes','?')}min)  —  {ts}",
+                font=ctk.CTkFont(size=11), text_color=color, anchor="w"
+                ).pack(anchor="w", padx=10, pady=6)
+
+    def _clear_history(self):
+        if messagebox.askyesno("Limpar histórico",
+                "Apagar todo o histórico? Esta ação não pode ser desfeita."):
+            self.config.data["history"] = []
+            self.config.save()
+            self._refresh_history()
+
+    # ══════════════════════════════════════════════════════
+    # ABA: OPÇÕES
+    # ══════════════════════════════════════════════════════
+
+    def _build_tab_options(self):
+        scroll = ctk.CTkScrollableFrame(
+            self._tab_opts, fg_color=COLORS["bg"],
+            scrollbar_button_color=COLORS["surface2"],
+            scrollbar_button_hover_color=COLORS["surface3"])
+        scroll.pack(fill="both", expand=True)
+
+        # ── Geral ─────────────────────────────────────────
+        f = self._card(scroll, "Geral")
         self.autostart_var = ctk.BooleanVar(value=self.config.get("autostart"))
         self._switch(f, "🚀  Iniciar com o sistema", self.autostart_var,
                      cmd=self._toggle_autostart)
 
-        # Atalhos globais
+        self.prevent_sleep_var = ctk.BooleanVar(
+            value=self.config.get("prevent_sleep"))
+        self._switch(
+            f, "⛔  Impedir hibernação durante o timer",
+            self.prevent_sleep_var,
+            cmd=lambda: self.config.set("prevent_sleep",
+                                        self.prevent_sleep_var.get()))
+
+        # ── Som e notificações ────────────────────────────
+        f2 = self._card(scroll, "Som e notificações")
+        self.sound_var = ctk.BooleanVar(value=self.config.get("sound_warning"))
+        self._switch(f2, "🔔  Beeps de aviso antes da ação", self.sound_var)
+        if not HAS_PLYER:
+            ctk.CTkLabel(f2, text="⚠  pip install plyer  para notificações nativas",
+                         font=ctk.CTkFont(size=10),
+                         text_color=COLORS["warning"]).pack(anchor="w", padx=16, pady=(0, 8))
+
+        # ── Atalhos ───────────────────────────────────────
+        f3 = self._card(scroll, "Atalhos globais de teclado")
         self.hotkeys_var = ctk.BooleanVar(value=self.config.get("hotkeys_enabled"))
-        hkr = ctk.CTkFrame(f, fg_color="transparent")
-        hkr.pack(fill="x", padx=16, pady=(0, 14))
-        hk_lbl = (f"⌨  Atalhos: {self.config.get('hotkey_start')} / "
-                  f"{self.config.get('hotkey_cancel')}")
-        ctk.CTkSwitch(hkr, text=hk_lbl, variable=self.hotkeys_var,
-                      font=ctk.CTkFont(size=12), text_color=COLORS["text_dim"],
+        hkr = ctk.CTkFrame(f3, fg_color="transparent")
+        hkr.pack(fill="x", padx=16, pady=(8, 4))
+        ctk.CTkSwitch(hkr, text=" ⌨  Habilitar atalhos globais",
+                      variable=self.hotkeys_var, font=ctk.CTkFont(size=12),
+                      text_color=COLORS["text_dim"],
                       button_color=COLORS["accent"], progress_color=COLORS["accent"],
                       onvalue=True, offvalue=False,
                       command=lambda: (
@@ -1057,106 +2090,109 @@ class ShutdownApp:
                          font=ctk.CTkFont(size=10),
                          text_color=COLORS["text_dim2"]).pack(side="right")
 
-    def _build_conditional(self):
-        f = self._card("Shutdown Condicional")
-        # self.cond_enabled_var = ctk.BooleanVar(value=self.config.get("cond_enabled"))
-        # self._switch(f, "Executar ação quando condição satisfeita",
-        #              self.cond_enabled_var)
+        for key, label in [("hotkey_start",  "Iniciar timer"),
+                            ("hotkey_cancel", "Cancelar timer"),
+                            ("hotkey_widget", "Widget")]:
+            row = ctk.CTkFrame(f3, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=(0, 6))
+            ctk.CTkLabel(row, text=f"{label}:", width=100,
+                         font=ctk.CTkFont(size=12), text_color=COLORS["text_dim"],
+                         anchor="w").pack(side="left")
+            var = tk.StringVar(value=self.config.get(key))
+            entry = ctk.CTkEntry(row, textvariable=var, width=160, height=28,
+                                 font=ctk.CTkFont(size=11),
+                                 fg_color=COLORS["surface2"],
+                                 border_color=COLORS["border"],
+                                 corner_radius=6, text_color=COLORS["text"])
+            entry.pack(side="left", padx=(0, 8))
+            entry.bind("<FocusOut>", lambda e, k=key, v=var: (
+                self.config.set(k, v.get()),
+                self.hotkeys.setup(self.config, self)))
 
-        if not HAS_PSUTIL:
-            ctk.CTkLabel(f, text="⚠  Instale psutil para usar este recurso",
-                         font=ctk.CTkFont(size=11),
-                         text_color=COLORS["warning"]).pack(anchor="w", padx=16, pady=(0,8))
-            self.cond_start_btn = None
-            return
+        ctk.CTkFrame(f3, fg_color="transparent", height=8).pack()
 
-        # Ação condicional
-        cr = ctk.CTkFrame(f, fg_color="transparent")
-        cr.pack(fill="x", padx=16, pady=(8, 8))
-        ctk.CTkLabel(cr, text="Ação:", font=ctk.CTkFont(size=12),
-                     text_color=COLORS["text_dim"]).pack(side="left", padx=(0, 8))
-        self.cond_action_var = ctk.StringVar(value=self.config.get("cond_action"))
-        label_to_key = {v: k for k, v in ACTION_LABELS.items()}
-        ctk.CTkOptionMenu(
-            cr, values=list(ACTION_LABELS.values()),
-            variable=tk.StringVar(value=ACTION_LABELS.get(self.config.get("cond_action"), "Desligar")),
-            width=130, height=28, font=ctk.CTkFont(size=12),
-            fg_color=COLORS["surface2"], button_color=COLORS["surface3"],
-            command=lambda v: self.cond_action_var.set(label_to_key.get(v, "shutdown"))
-        ).pack(side="left")
+        # ── Modo Gamer ────────────────────────────────────
+        f4 = self._card(scroll, "Modo Gamer")
+        self.gamer_var = ctk.BooleanVar(value=self.config.get("gamer_mode"))
+        gr = ctk.CTkFrame(f4, fg_color="transparent")
+        gr.pack(fill="x", padx=16, pady=(10, 6))
+        ctk.CTkSwitch(gr, text=" 🎮  Pausar timer quando jogo ativo",
+                      variable=self.gamer_var, font=ctk.CTkFont(size=12),
+                      text_color=COLORS["text_dim"],
+                      button_color=COLORS["accent"], progress_color=COLORS["accent"],
+                      onvalue=True, offvalue=False).pack(side="left")
+        ctk.CTkButton(gr, text="⚙  Processos", width=100, height=28,
+                      font=ctk.CTkFont(size=11),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
+                      corner_radius=6, text_color=COLORS["text_dim"],
+                      command=self._gamer_settings).pack(side="right")
 
-        # Condições
-        saved = {c.get("kind", ""): c for c in self.config.get("conditions")}
-        self._cond_vars: dict = {}
-        items = [
-            ("cpu_low",        "CPU < ", "10", "% (30s contínuos)"),
-            ("process_closed", "Processo fechado: ", "", "(ex: blender.exe)"),
-            ("download_done",  "Download concluído", "", ""),
-            ("idle",           "Inativo por ", "30", "min"),
-        ]
-        for kind, prefix, default_val, suffix in items:
-            sv = saved.get(kind, {})
-            row = ctk.CTkFrame(f, fg_color=COLORS["surface2"], corner_radius=8)
-            row.pack(fill="x", padx=16, pady=(0, 5))
-            chk = ctk.BooleanVar(value=sv.get("enabled", False))
-            par = tk.StringVar(value=sv.get("param", default_val))
-            ctk.CTkCheckBox(row, text=prefix, variable=chk,
-                            font=ctk.CTkFont(size=12),
-                            text_color=COLORS["text_dim"],
-                            checkbox_width=16, checkbox_height=16,
-                            checkmark_color="white",
-                            hover_color=COLORS["accent"],
-                            border_color=COLORS["border"],
-                            fg_color=COLORS["accent"]
-                            ).pack(side="left", padx=(10, 4), pady=8)
-            if default_val or kind == "process_closed":
-                ctk.CTkEntry(row, textvariable=par, width=52, height=24,
-                             font=ctk.CTkFont(size=12),
-                             fg_color=COLORS["surface3"], border_color=COLORS["border"],
-                             corner_radius=5, text_color=COLORS["text"]
-                             ).pack(side="left", padx=(0, 4))
-            if suffix:
-                ctk.CTkLabel(row, text=suffix, font=ctk.CTkFont(size=11),
-                             text_color=COLORS["text_dim2"]).pack(side="left")
-            self._cond_vars[kind] = (chk, par)
+        # Show selected processes count
+        procs = self.config.get("gamer_processes") or []
+        self._gamer_proc_lbl = ctk.CTkLabel(
+            f4, text=self._gamer_proc_text(procs),
+            font=ctk.CTkFont(size=11), text_color=COLORS["text_dim2"])
+        self._gamer_proc_lbl.pack(anchor="w", padx=16, pady=(0, 6))
 
-        self.cond_start_btn = ctk.CTkButton(
-            f, text="▶  Ativar monitoramento condicional",
-            height=36, font=ctk.CTkFont(size=13),
-            fg_color=COLORS["accent2"], hover_color="#6a4ce0",
-            text_color="white", corner_radius=8,
-            command=self._toggle_conditional)
-        self.cond_start_btn.pack(fill="x", padx=16, pady=(4, 14))
+        idle_row = ctk.CTkFrame(f4, fg_color="transparent")
+        idle_row.pack(fill="x", padx=16, pady=(0, 10))
+        ctk.CTkLabel(idle_row, text="Inatividade para pausar (seg):",
+                     font=ctk.CTkFont(size=12),
+                     text_color=COLORS["text_dim"]).pack(side="left")
+        self._gamer_idle_var = tk.StringVar(
+            value=str(self.config.get("gamer_idle_threshold")))
+        ctk.CTkEntry(idle_row, textvariable=self._gamer_idle_var,
+                     width=56, height=28, font=ctk.CTkFont(size=12),
+                     fg_color=COLORS["surface2"], border_color=COLORS["border"],
+                     corner_radius=6, text_color=COLORS["text"]
+                     ).pack(side="left", padx=8)
+        ctk.CTkButton(idle_row, text="Salvar", width=56, height=28,
+                      font=ctk.CTkFont(size=11),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["surface3"],
+                      corner_radius=6, text_color=COLORS["text_dim"],
+                      command=self._save_gamer_idle).pack(side="left")
 
-    def _build_controls(self):
-        f = ctk.CTkFrame(self._body, fg_color="transparent")
-        f.pack(fill="x", padx=20, pady=(8, 4))
+        # ── Timer adaptativo ──────────────────────────────
+        f5 = self._card(scroll, "Timer adaptativo")
+        self.adaptive_var = ctk.BooleanVar(value=self.config.get("adaptive_enabled"))
+        ar = ctk.CTkFrame(f5, fg_color="transparent")
+        ar.pack(fill="x", padx=16, pady=(10, 6))
+        ctk.CTkSwitch(ar, text=" 🖱  Detectar atividade e estender timer",
+                      variable=self.adaptive_var, font=ctk.CTkFont(size=12),
+                      text_color=COLORS["text_dim"],
+                      button_color=COLORS["accent"], progress_color=COLORS["accent"],
+                      onvalue=True, offvalue=False).pack(side="left")
+        self.adaptive_ext = tk.StringVar(
+            value=str(self.config.get("adaptive_extend_min")))
+        ctk.CTkEntry(ar, textvariable=self.adaptive_ext, width=46, height=24,
+                     font=ctk.CTkFont(size=11),
+                     fg_color=COLORS["surface2"], border_color=COLORS["border"],
+                     corner_radius=5, text_color=COLORS["text"]).pack(side="right")
+        ctk.CTkLabel(ar, text="min", font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim"]).pack(side="right", padx=2)
+        ctk.CTkFrame(f5, fg_color="transparent", height=8).pack()
 
-        row2 = ctk.CTkFrame(f, fg_color="transparent"); row2.pack(fill="x")
-        
-        ctk.CTkButton(
-            row2, text="⧉  Widget", height=36, font=ctk.CTkFont(size=13),
-            fg_color=COLORS["surface"], hover_color=COLORS["surface2"],
-            text_color=COLORS["text_dim"], corner_radius=8,
-            command=self._toggle_mini_widget
-        ).pack(side="left", expand=True, fill="x")
+    @staticmethod
+    def _gamer_proc_text(procs: list) -> str:
+        n = len(procs)
+        if n == 0: return "Nenhum processo monitorado"
+        if n == 1: return f"1 processo: {procs[0]}"
+        return f"{n} processos: {', '.join(procs[:2])}{'...' if n > 2 else ''}"
 
-    def _build_bottom_bar(self):
-        bar = ctk.CTkFrame(self._body, fg_color="transparent")
-        bar.pack(fill="x", padx=20, pady=(4, 20))
-        for lbl, cmd in [("📋 Histórico", self._show_history),
-                         ("📊 Stats",     self._show_stats),
-                         ("💾 Exportar",  self._export_history)]:
-            ctk.CTkButton(bar, text=lbl, height=30, font=ctk.CTkFont(size=12),
-                          fg_color=COLORS["surface"], hover_color=COLORS["surface2"],
-                          text_color=COLORS["text_dim"], corner_radius=7, command=cmd
-                          ).pack(side="left", padx=(0, 6))
+    def _save_gamer_idle(self):
+        try:
+            v = int(self._gamer_idle_var.get())
+            self.config.set("gamer_idle_threshold", v)
+        except ValueError:
+            pass
 
-    # ── Helpers de construção ─────────────────────────────
+    # ══════════════════════════════════════════════════════
+    # HELPERS DE CONSTRUÇÃO
+    # ══════════════════════════════════════════════════════
 
-    def _card(self, title: str) -> ctk.CTkFrame:
-        outer = ctk.CTkFrame(self._body, fg_color="transparent")
-        outer.pack(fill="x", padx=20, pady=(0, 10))
+    def _card(self, parent, title: str) -> ctk.CTkFrame:
+        outer = ctk.CTkFrame(parent, fg_color="transparent")
+        outer.pack(fill="x", padx=16, pady=(0, 10))
         if title:
             ctk.CTkLabel(outer, text=title, font=ctk.CTkFont(size=11),
                          text_color=COLORS["text_dim2"]).pack(anchor="w", pady=(0, 4))
@@ -1165,7 +2201,7 @@ class ShutdownApp:
         return inner
 
     def _switch(self, parent, text: str, var: ctk.BooleanVar,
-                cmd=None, bottom=6):
+                cmd=None, bottom: int = 6):
         sw = ctk.CTkSwitch(parent, text=f" {text}", variable=var,
                            font=ctk.CTkFont(size=12), text_color=COLORS["text_dim"],
                            button_color=COLORS["accent"],
@@ -1175,15 +2211,14 @@ class ShutdownApp:
         sw.pack(anchor="w", padx=16, pady=(8, bottom))
         return sw
 
-    # ── Modo countdown/schedule ───────────────────────────
+    # ── Modo countdown / schedule ─────────────────────────
 
     def _set_mode(self, mode: str):
         self.mode_var.set(mode)
         for k, btn in self._mode_btns.items():
-            if k == mode:
-                btn.configure(fg_color=COLORS["accent"], text_color="white")
-            else:
-                btn.configure(fg_color=COLORS["surface2"], text_color=COLORS["text"])
+            btn.configure(
+                fg_color=COLORS["accent"] if k == mode else COLORS["surface2"],
+                text_color="white"          if k == mode else COLORS["text"])
         if mode == "countdown":
             self._sc_frame.pack_forget()
             self._cd_frame.pack(fill="x", padx=16, pady=(0, 4))
@@ -1200,7 +2235,8 @@ class ShutdownApp:
             target = now.replace(hour=h, minute=m, second=0, microsecond=0)
             if target <= now: target += timedelta(days=1)
             diff   = int((target - now).total_seconds() / 60)
-            self._sched_info.configure(text=f"→ em {diff} min  ({target.strftime('%H:%M')})")
+            self._sched_info.configure(
+                text=f"→ em {diff} min  ({target.strftime('%H:%M')})")
         except Exception:
             self._sched_info.configure(text="Horário inválido")
 
@@ -1220,7 +2256,7 @@ class ShutdownApp:
         except Exception:
             return None
 
-    # ── Helpers gerais ────────────────────────────────────
+    # ── Apply config ──────────────────────────────────────
 
     def _apply_config(self):
         self._select_action(self.config.get("last_action"))
@@ -1233,8 +2269,9 @@ class ShutdownApp:
     def _select_action(self, key: str):
         self.action_var.set(key)
         for k, btn in self._action_buttons.items():
-            btn.configure(fg_color=COLORS["accent"] if k == key else COLORS["surface2"],
-                          text_color="white"          if k == key else COLORS["text"])
+            btn.configure(
+                fg_color=COLORS["accent"] if k == key else COLORS["surface2"],
+                text_color="white"          if k == key else COLORS["text"])
 
     def _validate_live(self, e=None):
         val = self.time_var.get().strip()
@@ -1260,8 +2297,8 @@ class ShutdownApp:
     def _update_display(self, s: int):
         self.timer_label.configure(text=self._fmt(s))
         self.progress_bar.set(self.engine.progress)
-        c = COLORS["danger"] if s <= 30 else (
-            COLORS["warning"] if s <= 300 else COLORS["text"])
+        c = (COLORS["danger"]  if s <= 30  else
+             COLORS["warning"] if s <= 300 else COLORS["text"])
         self.timer_label.configure(text_color=c)
         self.progress_bar.configure(
             progress_color=c if s <= 300 else COLORS["accent"])
@@ -1283,20 +2320,26 @@ class ShutdownApp:
         action  = self.action_var.get()
         minutes = seconds // 60
 
-        self.config.set("last_minutes",      minutes)
-        self.config.set("last_action",       action)
-        self.config.set("schedule_mode",     self.mode_var.get())
-        self.config.set("gamer_mode",        self.gamer_var.get())
-        self.config.set("sound_warning",     self.sound_var.get())
-        self.config.set("adaptive_enabled",  self.adaptive_var.get())
+        self.config.set("last_minutes",     minutes)
+        self.config.set("last_action",      action)
+        self.config.set("schedule_mode",    self.mode_var.get())
+        self.config.set("gamer_mode",       self.gamer_var.get())
+        self.config.set("sound_warning",    self.sound_var.get())
+        self.config.set("adaptive_enabled", self.adaptive_var.get())
         try: self.config.set("adaptive_extend_min", int(self.adaptive_ext.get()))
         except ValueError: pass
 
         if not self.engine.start(seconds, action): return
 
-        self.start_btn.configure(text="⏹  Cancelar",
-                                 fg_color=COLORS["danger"], hover_color="#d94040")
+        # Prevent sleep if enabled
+        if self.prevent_sleep_var.get():
+            SystemController.prevent_sleep(True)
+
+        self.start_btn.configure(
+            text="⏹  Cancelar",
+            fg_color=COLORS["danger"], hover_color="#d94040")
         self.pause_btn.configure(state="normal")
+        self.extend5_btn.configure(state="normal")
         self.time_entry.configure(state="disabled")
         for btn in self._action_buttons.values():
             btn.configure(state="disabled")
@@ -1304,11 +2347,13 @@ class ShutdownApp:
         icon = ACTION_ICONS.get(action, "⏻")
         if self.mode_var.get() == "schedule":
             h = int(self.sched_h.get()); m2 = int(self.sched_m.get())
-            self._status(f"{icon}  {ACTION_LABELS[action]} às {h:02d}:{m2:02d}",
-                         COLORS["text"])
+            self._status(
+                f"{icon}  {ACTION_LABELS[action]} às {h:02d}:{m2:02d}",
+                COLORS["text"])
         else:
-            self._status(f"{icon}  {ACTION_LABELS[action]} em {minutes}min",
-                         COLORS["text"])
+            self._status(
+                f"{icon}  {ACTION_LABELS[action]} em {minutes}min",
+                COLORS["text"])
         self._update_display(seconds)
 
         if self.gamer_var.get():
@@ -1320,6 +2365,7 @@ class ShutdownApp:
     def _cancel(self):
         self.engine.cancel()
         self.cond_mon.stop()
+        SystemController.prevent_sleep(False)
         for aid in [self._gamer_id, self._countdown_id]:
             if aid:
                 try: self.root.after_cancel(aid)
@@ -1328,13 +2374,21 @@ class ShutdownApp:
 
     def _pause_resume(self):
         paused = self.engine.pause_resume()
-        self.pause_btn.configure(text="▶  Retomar" if paused else "⏸  Pausar")
+        self.pause_btn.configure(
+            text="▶  Retomar" if paused else "⏸  Pausar")
+
+    def _extend_5min(self):
+        """Estende o timer ativo em 5 minutos."""
+        if not self.engine.is_running: return
+        self.engine.extend(300)
+        self._status("⏱  Timer estendido +5min", COLORS["success"])
 
     def _reset_ui(self):
         self.start_btn.configure(text="▶  Iniciar",
                                  fg_color=COLORS["accent"],
                                  hover_color=COLORS["accent_hover"])
         self.pause_btn.configure(text="⏸  Pausar", state="disabled")
+        self.extend5_btn.configure(state="disabled")
         self.time_entry.configure(state="normal")
         for btn in self._action_buttons.values():
             btn.configure(state="normal")
@@ -1348,33 +2402,37 @@ class ShutdownApp:
 
     def _on_tick(self, s: int):
         self._update_display(s)
-        # Timer adaptativo: atividade nos últimos 2min → estende
         if (self.adaptive_var.get() and s <= 120
                 and SystemController.get_idle_seconds() < 30):
             try: ext = int(self.adaptive_ext.get()) * 60
             except ValueError: ext = 600
             self.engine.extend(ext)
-            self._status(f"🖱  Atividade detectada → +{ext//60}min", COLORS["warning"])
+            self._status(f"🖱  Atividade detectada → +{ext//60}min",
+                         COLORS["warning"])
 
     def _on_warning(self, s: int):
         mins = s // 60
-        txt = f"⚠  Atenção: restam {mins}min!" if mins else f"⚠  Restam {s}s!"
+        txt  = (f"⚠  Atenção: restam {mins}min!" if mins
+                else f"⚠  Restam {s}s!")
         self._status(txt, COLORS["warning"])
         if s in (300, 60):
-            self.notif.send("ShutdownTimer ⚠",
-                f"{ACTION_LABELS.get(self.engine.state.action, 'Ação')} em "
-                f"{mins or s}{'min' if mins else 's'}")
+            sound = self.sound_var.get()
+            action_label = ACTION_LABELS.get(
+                self.engine.state.action, "Ação")
+            self.notif.warn(
+                "ShutdownTimer ⚠",
+                f"{action_label} em {mins or s}{'min' if mins else 's'}",
+                sound=sound)
 
     def _on_finished(self):
         action  = self.engine.state.action
         label   = ACTION_LABELS.get(action, action)
         minutes = self.engine.state.total_seconds // 60
 
-        if self.sound_var.get():
-            self.notif.play_beeps()
-
-        self.notif.send(f"⚠  {label} em 15 segundos",
-                        "Abra o ShutdownTimer para cancelar.")
+        self.notif.warn(
+            f"⚠  {label} em 15 segundos",
+            "Abra o ShutdownTimer para cancelar.",
+            sound=self.sound_var.get())
 
         cancelled = self._show_countdown_dialog(action, label)
         if cancelled:
@@ -1389,6 +2447,7 @@ class ShutdownApp:
     def _on_cancelled(self):
         self.config.add_history(self.engine.state.action,
                                 self.engine.state.total_seconds // 60, False)
+        SystemController.prevent_sleep(False)
         self._status("✓  Contagem cancelada.", COLORS["success"])
         self._reset_ui()
 
@@ -1403,9 +2462,10 @@ class ShutdownApp:
             self.cond_mon.stop(); self._cond_active = False
             if self.cond_start_btn:
                 self.cond_start_btn.configure(
-                    text="▶  Ativar monitoramento condicional",
+                    text="▶  Ativar monitoramento",
                     fg_color=COLORS["accent2"])
-            self._status("Monitoramento condicional encerrado.", COLORS["text_dim"])
+            if hasattr(self, "_cond_status_lbl"):
+                self._cond_status_lbl.configure(text="")
             return
 
         conditions = [
@@ -1413,7 +2473,8 @@ class ShutdownApp:
             for kind, (chk, par) in self._cond_vars.items()
         ]
         if not any(c.enabled for c in conditions):
-            messagebox.showwarning("Atenção", "Habilite ao menos uma condição.")
+            messagebox.showwarning("Atenção",
+                "Habilite ao menos uma condição.")
             return
 
         action = self.cond_action_var.get()
@@ -1423,7 +2484,10 @@ class ShutdownApp:
             self.cond_start_btn.configure(
                 text="⏹  Parar monitoramento",
                 fg_color=COLORS["danger"])
-        self._status("👁  Monitorando condições...", COLORS["accent"])
+        if hasattr(self, "_cond_status_lbl"):
+            self._cond_status_lbl.configure(
+                text="👁  Monitorando condições...",
+                text_color=COLORS["accent"])
         self.config.set("cond_action", action)
         self.config.set("conditions",
             [{"kind": c.kind, "param": c.param, "enabled": c.enabled}
@@ -1433,35 +2497,43 @@ class ShutdownApp:
         self._cond_active = False
         if self.cond_start_btn:
             self.cond_start_btn.configure(
-                text="▶  Ativar monitoramento condicional",
+                text="▶  Ativar monitoramento",
                 fg_color=COLORS["accent2"])
+        if hasattr(self, "_cond_status_lbl"):
+            self._cond_status_lbl.configure(text="")
+
         label = ACTION_LABELS.get(action, action)
-        self.notif.send("Condição satisfeita!",
-                        f"{desc}\n{label} em 15s.")
+        self.notif.warn("Condição satisfeita!",
+                        f"{desc}\n{label} em 15s.",
+                        sound=self.sound_var.get())
         cancelled = self._show_countdown_dialog(
             action, f"{label}  [{desc}]")
         if not cancelled:
             self.config.add_history(action, 0, completed=True)
             SystemController.execute(action)
         else:
-            self._status("✓  Ação condicional cancelada.", COLORS["success"])
+            if hasattr(self, "_cond_status_lbl"):
+                self._cond_status_lbl.configure(
+                    text="✓  Ação condicional cancelada.",
+                    text_color=COLORS["success"])
 
     # ── Modo gamer ────────────────────────────────────────
 
     def _gamer_check(self):
         if not self.engine.is_running: return
-        idle     = SystemController.get_idle_seconds()
-        threshold= self.config.get("gamer_idle_threshold")
-        fs       = SystemController.is_fullscreen_active()
-        procs    = self.config.get("gamer_processes") or []
-        proc_ok  = any(SystemController.is_process_running(p) for p in procs if p)
+        idle      = SystemController.get_idle_seconds()
+        threshold = self.config.get("gamer_idle_threshold")
+        fs        = SystemController.is_fullscreen_active()
+        procs     = self.config.get("gamer_processes") or []
+        proc_ok   = any(SystemController.is_process_running(p) for p in procs if p)
 
         should_pause = (idle < threshold) or fs or proc_ok
         if should_pause and not self.engine.state.paused:
             self.engine.pause_resume()
-            reasons = ([f"inativo <{threshold}s"] if idle < threshold else []) + \
-                      (["fullscreen"] if fs else []) + \
-                      (["processo"] if proc_ok else [])
+            reasons = (
+                ([f"inativo <{threshold}s"] if idle < threshold else []) +
+                (["fullscreen"] if fs else []) +
+                (["processo"] if proc_ok else []))
             self._status(f"🎮  Pausado ({', '.join(reasons)})",
                          COLORS["warning"])
         elif not should_pause and self.engine.state.paused:
@@ -1471,48 +2543,19 @@ class ShutdownApp:
         self._gamer_id = self.root.after(5000, self._gamer_check)
 
     def _gamer_settings(self):
-        win = ctk.CTkToplevel(self.root)
-        win.title("Modo Gamer — configurações")
-        win.geometry("360x300")
-        win.configure(fg_color=COLORS["bg"]); win.grab_set()
-
-        ctk.CTkLabel(win, text="Processos que pausam o timer",
-                     font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=COLORS["text"]).pack(pady=(20, 2), padx=20, anchor="w")
-        ctk.CTkLabel(win, text="Um por linha  —  ex: valorant.exe, blender.exe",
-                     font=ctk.CTkFont(size=11),
-                     text_color=COLORS["text_dim"]).pack(padx=20, anchor="w")
-
-        txt = ctk.CTkTextbox(win, height=100, font=ctk.CTkFont(size=12),
-                             fg_color=COLORS["surface2"],
-                             text_color=COLORS["text"], corner_radius=8)
-        txt.pack(fill="x", padx=20, pady=8)
-        txt.insert("1.0", "\n".join(self.config.get("gamer_processes") or []))
-
-        ctk.CTkLabel(win, text="Segundos de inatividade para pausar:",
-                     font=ctk.CTkFont(size=12),
-                     text_color=COLORS["text_dim"]).pack(padx=20, anchor="w")
-        idle_var = tk.StringVar(value=str(self.config.get("gamer_idle_threshold")))
-        ctk.CTkEntry(win, textvariable=idle_var, width=80, height=30,
-                     fg_color=COLORS["surface2"], corner_radius=6,
-                     text_color=COLORS["text"]).pack(padx=20, anchor="w", pady=4)
-
-        def save():
-            lines = [l.strip() for l in
-                     txt.get("1.0", "end").splitlines() if l.strip()]
-            self.config.set("gamer_processes", lines)
-            try: self.config.set("gamer_idle_threshold", int(idle_var.get()))
-            except ValueError: pass
-            win.destroy()
-
-        ctk.CTkButton(win, text="💾 Salvar", command=save, height=36,
-                      fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
-                      corner_radius=8).pack(pady=12)
+        """Abre ProcessSelector para selecionar processos do modo gamer."""
+        current = self.config.get("gamer_processes") or []
+        def cb(selected):
+            self.config.set("gamer_processes", selected)
+            if hasattr(self, "_gamer_proc_lbl"):
+                self._gamer_proc_lbl.configure(
+                    text=self._gamer_proc_text(selected))
+        ProcessSelector(self.root, selected_processes=current, callback=cb)
 
     # ── Dialog 15s ────────────────────────────────────────
 
     def _show_countdown_dialog(self, action: str, label: str) -> bool:
-        icon = ACTION_ICONS.get(action, "⏻")
+        icon      = ACTION_ICONS.get(action, "⏻")
         cancelled = {"v": False}
 
         dlg = ctk.CTkToplevel(self.root)
@@ -1525,8 +2568,7 @@ class ShutdownApp:
         dlg.geometry(
             f"380x280+"
             f"{self.root.winfo_x() + (self.root.winfo_width() - 380)//2}+"
-            f"{self.root.winfo_y() + (self.root.winfo_height() - 280)//2}"
-        )
+            f"{self.root.winfo_y() + (self.root.winfo_height() - 280)//2}")
 
         ctk.CTkLabel(dlg, text=f"{icon}  {label}",
                      font=ctk.CTkFont(size=16, weight="bold"),
@@ -1543,7 +2585,8 @@ class ShutdownApp:
 
         prog = ctk.CTkProgressBar(dlg, height=6,
                                   fg_color=COLORS["surface2"],
-                                  progress_color=COLORS["danger"], corner_radius=3)
+                                  progress_color=COLORS["danger"],
+                                  corner_radius=3)
         prog.pack(fill="x", padx=24, pady=(0, 10)); prog.set(1.0)
 
         def do_cancel():
@@ -1554,7 +2597,8 @@ class ShutdownApp:
                 self._countdown_id = None
             dlg.destroy()
 
-        ctk.CTkButton(dlg, text="✕  Cancelar ação", height=40, width=200,
+        ctk.CTkButton(dlg, text="✕  Cancelar ação",
+                      height=40, width=200,
                       font=ctk.CTkFont(size=14, weight="bold"),
                       fg_color=COLORS["danger"], hover_color="#c94040",
                       text_color="white", corner_radius=10,
@@ -1584,72 +2628,21 @@ class ShutdownApp:
         if self.mini: self.mini.update()
         self._widget_tick = self.root.after(1000, self._widget_loop)
 
-    # ── Histórico / Stats / Exportar ─────────────────────
+    # ── Exportar histórico ────────────────────────────────
 
-    def _show_history(self):
-        history = self.config.get("history")
-        if not history:
-            messagebox.showinfo("Histórico", "Nenhuma ação registrada ainda.")
-            return
-        win = ctk.CTkToplevel(self.root)
-        win.title("Histórico"); win.geometry("420x460")
-        win.configure(fg_color=COLORS["bg"]); win.grab_set()
-        ctk.CTkLabel(win, text="Histórico",
-                     font=ctk.CTkFont(size=16, weight="bold"),
-                     text_color=COLORS["text"]).pack(pady=(16, 8))
-        scroll = ctk.CTkScrollableFrame(win, fg_color=COLORS["surface"],
-                                        corner_radius=10)
-        scroll.pack(fill="both", expand=True, padx=16, pady=(0, 12))
-        for e in history:
-            ts     = e.get("timestamp", "")[:16].replace("T", " ")
-            action = ACTION_LABELS.get(e.get("action", ""), e.get("action", ""))
-            done   = "✓" if e.get("completed") else "✗"
-            color  = COLORS["success"] if e.get("completed") else COLORS["danger"]
-            row = ctk.CTkFrame(scroll, fg_color=COLORS["surface2"], corner_radius=8)
-            row.pack(fill="x", pady=3, padx=4)
-            ctk.CTkLabel(row,
-                text=f"{done}  {action} ({e.get('minutes','?')}min) — {ts}",
-                font=ctk.CTkFont(size=12), text_color=color
-            ).pack(anchor="w", padx=12, pady=8)
-
-    def _show_stats(self):
-        s     = self.config.get("stats") or {}
-        total = s.get("total_completed", 0)
-        mins  = s.get("total_minutes", 0)
-        by_a  = s.get("by_action", {})
-
-        win = ctk.CTkToplevel(self.root)
-        win.title("Estatísticas"); win.geometry("360x380")
-        win.configure(fg_color=COLORS["bg"]); win.grab_set()
-        ctk.CTkLabel(win, text="📊  Estatísticas",
-                     font=ctk.CTkFont(size=16, weight="bold"),
-                     text_color=COLORS["text"]).pack(pady=(20, 12))
-        f = ctk.CTkFrame(win, fg_color=COLORS["surface"], corner_radius=10)
-        f.pack(fill="x", padx=20)
-        rows = [("Total de ações concluídas", str(total)),
-                ("Minutos totais agendados",   str(mins))] + [
-               (f"{ACTION_ICONS.get(k,'')} {ACTION_LABELS.get(k,k)}", str(v))
-               for k, v in by_a.items()]
-        for lbl, val in rows:
-            r = ctk.CTkFrame(f, fg_color="transparent"); r.pack(fill="x", padx=12, pady=5)
-            ctk.CTkLabel(r, text=lbl, font=ctk.CTkFont(size=13),
-                         text_color=COLORS["text_dim"]).pack(side="left")
-            ctk.CTkLabel(r, text=val, font=ctk.CTkFont(size=13, weight="bold"),
-                         text_color=COLORS["accent"]).pack(side="right")
-        ctk.CTkLabel(win, text=f"⚡  ~{mins/60:.1f}h de energia economizada",
-                     font=ctk.CTkFont(size=11),
-                     text_color=COLORS["text_dim2"]).pack(pady=(16, 0))
-
-    def _export_history(self):
-        fmt  = messagebox.askquestion("Exportar", "Exportar como CSV?\n(Não = JSON)")
-        ext  = ".csv" if fmt == "yes" else ".json"
+    def _export_history(self, fmt: str = ""):
+        if not fmt:
+            ans = messagebox.askquestion("Exportar",
+                "Exportar como CSV?\n(Não = JSON)")
+            fmt = "csv" if ans == "yes" else "json"
+        ext  = ".csv" if fmt == "csv" else ".json"
         path = filedialog.asksaveasfilename(
             defaultextension=ext,
             filetypes=[("CSV","*.csv"),("JSON","*.json")],
             initialfile=f"shutdown_history{ext}")
         if not path: return
         try:
-            if fmt == "yes": self.config.export_csv(path)
+            if fmt == "csv": self.config.export_csv(path)
             else:            self.config.export_json(path)
             messagebox.showinfo("Exportado", f"Salvo em:\n{path}")
         except Exception as e:
@@ -1671,11 +2664,13 @@ class ShutdownApp:
             self.root.withdraw()
 
     def _show_window(self):
-        self.root.deiconify(); self.root.lift(); self.root.focus_force()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     def _on_close(self):
         if self.engine.is_running and HAS_TRAY:
-            self.root.withdraw(); return   # Minimiza para tray
+            self.root.withdraw(); return
         if self.engine.is_running:
             if not messagebox.askyesno("Sair",
                     "Timer em andamento. Deseja sair e cancelar?"):
@@ -1683,7 +2678,11 @@ class ShutdownApp:
         self._quit_app()
 
     def _quit_app(self):
-        self.engine.cancel(); self.cond_mon.stop(); self.hotkeys.clear()
+        self.engine.cancel()
+        self.cond_mon.stop()
+        self.scheduler.stop()
+        self.hotkeys.clear()
+        SystemController.prevent_sleep(False)
         if self.mini: self.mini.hide()
         self.tray.stop()
         if self._widget_tick:
@@ -1693,23 +2692,12 @@ class ShutdownApp:
 
 
 # ══════════════════════════════════════════════════════════════
-# 11. CLI
+# 13. CLI
 # ══════════════════════════════════════════════════════════════
 
 def run_cli() -> bool:
-    """
-    Modo linha de comando. Retorna True se executou CLI, False se deve abrir GUI.
-
-    Exemplos:
-        python shutdown_timer.py --shutdown 30
-        python shutdown_timer.py --suspend  60
-        python shutdown_timer.py --lock     15
-        python shutdown_timer.py --cancel
-        python shutdown_timer.py --status
-        python shutdown_timer.py --gui
-    """
     p = argparse.ArgumentParser(prog="shutdown_timer",
-                                description="ShutdownTimer — modo CLI")
+                                description="ShutdownTimer v4 — CLI")
     p.add_argument("--shutdown", type=int, metavar="MIN")
     p.add_argument("--suspend",  type=int, metavar="MIN")
     p.add_argument("--reboot",   type=int, metavar="MIN")
@@ -1731,7 +2719,8 @@ def run_cli() -> bool:
                     state_file.unlink(missing_ok=True)
                     print("✓ Timer cancelado.")
                 except ProcessLookupError:
-                    print("Nenhum timer ativo."); state_file.unlink(missing_ok=True)
+                    print("Nenhum timer ativo.")
+                    state_file.unlink(missing_ok=True)
         else:
             print("Nenhum timer ativo.")
         return True
@@ -1781,25 +2770,31 @@ def run_cli() -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-# 12. ENTRY POINT
+# 14. ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
-def resource_path(relative_path):
+def resource_path(relative_path: str) -> str:
     try:
-        base_path = sys._MEIPASS
+        base_path = sys._MEIPASS  # type: ignore[attr-defined]
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
 
 def main():
     if len(sys.argv) > 1 and "--gui" not in sys.argv:
         if run_cli(): return
 
-    import ctypes
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("shutdown.timer.app")
+    if SystemController.PLATFORM == "Windows":
+        import ctypes as _ct
+        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "shutdown.timer.app")
 
     root = ctk.CTk()
-    root.iconbitmap(resource_path("icos/shutdown.ico"))
+    ico  = resource_path("icos/shutdown.ico")
+    if os.path.exists(ico):
+        try: root.iconbitmap(ico)
+        except Exception: pass
     ShutdownApp(root)
     root.mainloop()
 
