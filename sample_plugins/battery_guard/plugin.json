@@ -1,0 +1,44 @@
+{
+    "id":          "battery_guard",
+    "name":        "Battery Guard",
+    "version":     "1.2.0",
+    "author":      "Community",
+    "description": "Pausa o timer automaticamente quando a bateria fica abaixo do nível configurado. Ideal para notebooks.",
+    "permissions": ["process_list"],
+    "entry":       "main.py",
+    "parameters": [
+        {
+            "id":          "threshold",
+            "label":       "Limiar de bateria (%)",
+            "type":        "integer",
+            "default":     20,
+            "min":         5,
+            "max":         90,
+            "description": "Pausa o timer quando a bateria atingir este percentual"
+        },
+        {
+            "id":          "action",
+            "label":       "Ação ao atingir o limiar",
+            "type":        "choice",
+            "choices":     ["pause_timer", "cancel_timer", "notify"],
+            "default":     "pause_timer",
+            "description": "O que fazer quando a bateria estiver baixa"
+        },
+        {
+            "id":          "ignore_when_plugged",
+            "label":       "Ignorar quando carregando",
+            "type":        "boolean",
+            "default":     true,
+            "description": "Não pausa o timer se o carregador estiver conectado"
+        }
+    ],
+    "conditions": [
+        {
+            "id":          "battery_guard.check_low_battery",
+            "label":       "Bateria baixa",
+            "description": "Verdadeiro quando a bateria está abaixo do limiar",
+            "params_schema": {}
+        }
+    ],
+    "actions": []
+}

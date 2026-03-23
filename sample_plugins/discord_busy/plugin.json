@@ -1,0 +1,24 @@
+{
+    "id":          "discord_busy",
+    "name":        "Discord Busy",
+    "version":     "2.0.1",
+    "author":      "GamerStudio",
+    "description": "Pausa o timer enquanto você está em chamada de voz no Discord.",
+    "permissions": ["process_list"],
+    "entry":       "main.py",
+    "conditions": [
+        {
+            "id":          "discord_busy.check_discord_call",
+            "label":       "Discord em chamada",
+            "description": "Verdadeiro quando o Discord está em chamada de voz/vídeo ativa",
+            "params_schema": {
+                "also_check_muted": {
+                    "type": "bool",
+                    "default": false,
+                    "label": "Pausar mesmo se mutado"
+                }
+            }
+        }
+    ],
+    "actions": []
+}

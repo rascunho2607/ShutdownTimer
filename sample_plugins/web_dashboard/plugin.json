@@ -1,0 +1,119 @@
+{
+    "id":          "web_dashboard",
+    "name":        "Web Dashboard",
+    "version":     "2.0.0",
+    "author":      "Community",
+    "description": "Servidor HTTP local com dashboard responsivo para monitorar e controlar o timer remotamente via navegador (PC, celular, tablet na mesma rede Wi-Fi).",
+    "permissions": ["network", "notifications", "process_list"],
+    "entry":       "main.py",
+    "parameters": [
+        {
+            "id":          "port",
+            "label":       "Porta HTTP",
+            "type":        "integer",
+            "default":     8080,
+            "min":         1024,
+            "max":         65535,
+            "description": "Porta onde o servidor web vai escutar (padrão: 8080)"
+        },
+        {
+            "id":          "host",
+            "label":       "Interface de rede",
+            "type":        "choice",
+            "choices":     ["0.0.0.0", "127.0.0.1"],
+            "default":     "0.0.0.0",
+            "description": "0.0.0.0 = acessível na rede local; 127.0.0.1 = somente este PC"
+        },
+        {
+            "id":          "pin",
+            "label":       "PIN de segurança (deixe vazio para desativar)",
+            "type":        "password",
+            "default":     "",
+            "description": "PIN numérico de 4-8 dígitos para proteger o acesso remoto"
+        },
+        {
+            "id":          "allow_control",
+            "label":       "Permitir controle remoto",
+            "type":        "boolean",
+            "default":     true,
+            "description": "Permite cancelar, pausar e estender o timer pelo navegador"
+        },
+        {
+            "id":          "extend_minutes",
+            "label":       "Tempo de extensão rápida (minutos)",
+            "type":        "integer",
+            "default":     10,
+            "min":         1,
+            "max":         120,
+            "description": "Quantidade de minutos adicionados pelo botão '+X min' no dashboard"
+        },
+        {
+            "id":          "refresh_interval",
+            "label":       "Intervalo de atualização automática (segundos)",
+            "type":        "integer",
+            "default":     5,
+            "min":         1,
+            "max":         60,
+            "description": "Com que frequência o dashboard atualiza os dados automaticamente"
+        },
+        {
+            "id":          "show_history",
+            "label":       "Mostrar histórico do dia no dashboard",
+            "type":        "boolean",
+            "default":     true,
+            "description": "Exibe as últimas ações executadas hoje na parte inferior do dashboard"
+        },
+        {
+            "id":          "theme",
+            "label":       "Tema visual do dashboard",
+            "type":        "choice",
+            "choices":     ["dark", "light"],
+            "default":     "dark",
+            "description": "Tema de cores do dashboard web"
+        },
+        {
+            "id":          "start_on_load",
+            "label":       "Iniciar servidor automaticamente ao carregar",
+            "type":        "boolean",
+            "default":     true,
+            "description": "Inicia o servidor HTTP assim que o plugin é carregado"
+        },
+        {
+            "id":          "show_start_panel",
+            "label":       "Mostrar painel de iniciar timer",
+            "type":        "boolean",
+            "default":     true,
+            "description": "Exibe o formulário para iniciar o timer pelo navegador"
+        },
+        {
+            "id":          "show_cpu",
+            "label":       "Mostrar CPU e RAM",
+            "type":        "boolean",
+            "default":     true,
+            "description": "Exibe gráfico de uso de CPU e RAM em tempo real"
+        },
+        {
+            "id":          "show_network",
+            "label":       "Mostrar tráfego de rede",
+            "type":        "boolean",
+            "default":     true,
+            "description": "Exibe velocidade de download e upload em tempo real"
+        },
+        {
+            "id":          "show_processes",
+            "label":       "Mostrar processos",
+            "type":        "boolean",
+            "default":     true,
+            "description": "Lista os processos com maior uso de CPU"
+        }
+    ],
+    "conditions": [],
+    "actions": [],
+    "ui": {
+        "type":     "tab",
+        "tab_name": "Web Dashboard",
+        "icon":     "🌐",
+        "entry":    "ui.py",
+        "class":    "WebDashboardUI"
+    }
+}

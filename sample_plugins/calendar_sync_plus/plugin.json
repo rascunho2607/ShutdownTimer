@@ -1,0 +1,56 @@
+{
+  "id": "calendar_sync_plus",
+  "name": "Calendar Sync Plus",
+  "version": "1.3.0",
+  "author": "CalDev",
+  "description": "Integração avançada com Outlook e Calendário do Windows. Bloqueia desligamento durante reuniões, agenda desligamento automático pós-evento e muito mais.",
+  "permissions": ["filesystem", "network"],
+  "tags": ["outlook", "calendário", "office", "reunião", "agenda"],
+  "requires": {
+    "python": ">=3.8"
+  },
+  "conditions": [
+    {
+      "id": "calendar_sync_plus.has_active_event",
+      "label": "Tem evento ativo agora",
+      "description": "Retorna verdadeiro se há um evento/reunião em andamento no Outlook ou Calendário do Windows",
+      "params": {
+        "sources":           { "type": "string",  "default": "outlook,windows",  "description": "Fontes a verificar: 'outlook', 'windows' ou 'outlook,windows'" },
+        "buffer_before_min": { "type": "integer", "default": 5,                  "description": "Minutos antes do evento para começar a bloquear" },
+        "buffer_after_min":  { "type": "integer", "default": 0,                  "description": "Minutos após o evento para continuar bloqueando" },
+        "ignore_keywords":   { "type": "string",  "default": "",                 "description": "Palavras-chave no título do evento para ignorar (separadas por vírgula)" }
+      }
+    },
+    {
+      "id": "calendar_sync_plus.has_event_in_next_minutes",
+      "label": "Tem evento nos próximos N minutos",
+      "description": "Retorna verdadeiro se há um evento agendado nos próximos N minutos",
+      "params": {
+        "sources":        { "type": "string",  "default": "outlook,windows", "description": "Fontes a verificar" },
+        "lookahead_min":  { "type": "integer", "default": 30,                "description": "Janela de verificação em minutos" },
+        "ignore_keywords":{ "type": "string",  "default": "",                "description": "Palavras-chave no título do evento para ignorar" }
+      }
+    },
+    {
+      "id": "calendar_sync_plus.is_free_until_eod",
+      "label": "Sem eventos até o fim do dia",
+      "description": "Retorna verdadeiro se não há mais eventos para o dia — útil para desligar automaticamente",
+      "params": {
+        "sources":     { "type": "string",  "default": "outlook,windows", "description": "Fontes a verificar" },
+        "eod_hour":    { "type": "integer", "default": 23,                "description": "Hora de corte para 'fim do dia'" },
+        "eod_minute":  { "type": "integer", "default": 59,                "description": "Minuto de corte para 'fim do dia'" }
+      }
+    }
+  ],
+  "actions": [
+    {
+      "id": "calendar_sync_plus.log_next_event",
+      "label": "Registrar próximo evento",
+      "description": "Escreve no log o próximo evento encontrado (diagnóstico)",
+      "params": {
+        "sources":       { "type": "string",  "default": "outlook,windows", "description": "Fontes a verificar" },
+        "lookahead_min": { "type": "integer", "default": 120,               "description": "Janela de verificação em minutos" }
+      }
+    }
+  ]
+}

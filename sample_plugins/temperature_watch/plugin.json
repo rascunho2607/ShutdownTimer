@@ -1,0 +1,86 @@
+{
+    "id":          "temperature_watch",
+    "name":        "Temperature Watch",
+    "version":     "1.0.0",
+    "author":      "ThermalDev",
+    "description": "Monitora a temperatura da CPU e pausa o timer se ultrapassar o limiar configurado.",
+    "permissions": ["process_list", "notifications"],
+    "entry":       "main.py",
+    "parameters": [
+        {
+            "id":          "threshold",
+            "label":       "Limite de temperatura (°C)",
+            "type":        "integer",
+            "default":     85,
+            "min":         40,
+            "max":         110,
+            "description": "Temperatura da CPU que aciona o plugin"
+        },
+        {
+            "id":          "poll_interval",
+            "label":       "Intervalo de verificação (segundos)",
+            "type":        "integer",
+            "default":     10,
+            "min":         5,
+            "max":         120,
+            "description": "Com que frequência verificar a temperatura"
+        },
+        {
+            "id":      "action",
+            "label":   "Ação ao atingir o limite",
+            "type":    "choice",
+            "choices": ["notify", "pause_timer", "cancel_timer"],
+            "default": "pause_timer",
+            "description": "O que fazer quando a CPU estiver superaquecendo"
+        },
+        {
+            "id":          "auto_resume",
+            "label":       "Retomar automaticamente quando normalizar",
+            "type":        "boolean",
+            "default":     true,
+            "description": "Retoma o timer quando a temperatura voltar ao normal"
+        },
+        {
+            "id":      "sensor_source",
+            "label":   "Fonte do sensor de temperatura",
+            "type":    "choice",
+            "choices": ["auto", "psutil", "wmi", "manual"],
+            "default": "auto",
+            "description": "Como obter a temperatura da CPU. 'auto' tenta psutil e depois WMI. 'manual' usa o valor fixo abaixo."
+        },
+        {
+            "id":          "manual_temp",
+            "label":       "Temperatura manual (°C) — apenas se fonte = manual",
+            "type":        "integer",
+            "default":     50,
+            "min":         0,
+            "max":         200,
+            "description": "Valor fixo de temperatura usado quando a fonte é 'manual' (útil para testes ou sensores não suportados)"
+        },
+        {
+            "id":          "psutil_sensor_key",
+            "label":       "Chave do sensor psutil (opcional)",
+            "type":        "string",
+            "default":     "",
+            "description": "Nome do sensor psutil a usar (ex: coretemp, k10temp, acpitz). Deixe em branco para usar o primeiro disponível."
+        }
+    ],
+    "ui": {
+        "type":   "window",
+        "title":  "🌡️ Temperature Watch",
+        "entry":  "ui.py",
+        "class":  "TemperatureUI",
+        "icon":   "🌡️",
+        "width":  440,
+        "height": 340
+    },
+    "conditions": [
+        {
+            "id":          "temperature_watch.is_overheating",
+            "label":       "CPU superaquecendo",
+            "description": "Verdadeiro quando a temperatura da CPU excede o limiar configurado",
+            "params_schema": {}
+        }
+    ],
+    "actions": []
+}

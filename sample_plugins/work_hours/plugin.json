@@ -1,0 +1,33 @@
+{
+    "id":          "work_hours",
+    "name":        "Work Hours Only",
+    "version":     "1.1.0",
+    "author":      "ProdDev",
+    "description": "Bloqueia agendamentos automáticos fora do horário de trabalho configurado.",
+    "permissions": [],
+    "entry":       "main.py",
+    "conditions": [
+        {
+            "id":          "work_hours.check_outside_work_hours",
+            "label":       "Fora do horário de trabalho",
+            "description": "Verdadeiro quando o horário atual está fora da janela configurada",
+            "params_schema": {
+                "start_hour":   {"type": "int", "default": 9,  "label": "Hora de início"},
+                "start_minute": {"type": "int", "default": 0,  "label": "Minuto de início"},
+                "end_hour":     {"type": "int", "default": 18, "label": "Hora de fim"},
+                "end_minute":   {"type": "int", "default": 0,  "label": "Minuto de fim"},
+                "block_weekends": {"type": "bool", "default": true, "label": "Bloquear fins de semana"}
+            }
+        },
+        {
+            "id":          "work_hours.check_inside_work_hours",
+            "label":       "Dentro do horário de trabalho",
+            "description": "Verdadeiro quando estamos no horário de trabalho",
+            "params_schema": {
+                "start_hour":   {"type": "int", "default": 9,  "label": "Hora de início"},
+                "end_hour":     {"type": "int", "default": 18, "label": "Hora de fim"}
+            }
+        }
+    ],
+    "actions": []
+}

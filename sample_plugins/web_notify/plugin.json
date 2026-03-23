@@ -1,0 +1,24 @@
+{
+    "id":          "web_notify",
+    "name":        "Web Notify",
+    "version":     "1.0.2",
+    "author":      "NetDev",
+    "description": "Envia notificação HTTP/webhook quando o ShutdownTimer executa uma ação.",
+    "permissions": ["network", "notifications"],
+    "entry":       "main.py",
+    "conditions": [],
+    "actions": [
+        {
+            "id":          "web_notify.send_webhook",
+            "label":       "Enviar Webhook",
+            "description": "POST JSON para a URL configurada",
+            "params_schema": {
+                "url":     {"type": "str", "default": "", "label": "URL do Webhook"},
+                "method":  {"type": "str", "default": "POST", "label": "Método HTTP"},
+                "payload": {"type": "str", "default": "{\"event\": \"{event}\", \"ts\": \"{timestamp}\"}", "label": "Payload JSON (suporta {event}, {timestamp}, {action})"},
+                "headers": {"type": "str", "default": "{}", "label": "Headers extras (JSON)"},
+                "timeout": {"type": "int", "default": 5,  "label": "Timeout (s)"}
+            }
+        }
+    ]
+}
